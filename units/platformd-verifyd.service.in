@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+[Unit]
+Description=platformd user-presence verification service
+Documentation=man:platformd-verifyd.service(8)
+After=platformd-trustd.service
+Wants=platformd-trustd.service
+
+[Service]
+Type=notify
+ExecStart=@LIBEXECDIR@/platformd-verifyd
+RuntimeDirectory=platformd-verifyd
+RuntimeDirectoryMode=0755
+
+# The service drives PAM, whose factor backends reach hardware — the fingerprint
+# reader (via fprintd on the system bus), a camera, a security key. NoNewPrivileges
+# is left off because a PAM module may need a privileged helper. The hardening
+# below suits local hardware factors; a factor that needs the network or writes
+# state outside the runtime directory may require relaxing ProtectSystem or
+# RestrictAddressFamilies.
+NoNewPrivileges=no
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

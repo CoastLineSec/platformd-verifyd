@@ -1,0 +1,98 @@
+<?xml version='1.0'?>
+<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
+
+<refentry id="verifyctl" xmlns:xi="http://www.w3.org/2001/XInclude">
+
+  <refentryinfo>
+    <title>verifyctl</title>
+    <productname>platformd</productname>
+  </refentryinfo>
+
+  <refmeta>
+    <refentrytitle>verifyctl</refentrytitle>
+    <manvolnum>1</manvolnum>
+    <refmiscinfo class="source">platformd</refmiscinfo>
+    <refmiscinfo class="manual">platformd-verifyd</refmiscinfo>
+  </refmeta>
+
+  <refnamediv>
+    <refname>verifyctl</refname>
+    <refpurpose>Request a user-presence verification</refpurpose>
+  </refnamediv>
+
+  <refsynopsisdiv>
+    <cmdsynopsis>
+      <command>verifyctl</command>
+      <arg choice="opt" rep="repeat">OPTIONS</arg>
+      <arg choice="req">COMMAND</arg>
+      <arg choice="opt" rep="repeat">ARGS</arg>
+    </cmdsynopsis>
+  </refsynopsisdiv>
+
+  <refsect1>
+    <title>Description</title>
+
+    <para><command>verifyctl</command> asks
+    <citerefentry><refentrytitle>platformd-verifyd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+    to verify that the current user is present, by running the configured factors
+    (touch the fingerprint reader, look at the camera, …). It is a client of the
+    <constant>io.platformd.Verify</constant>
+    <citerefentry><refentrytitle>varlink</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+    interface. A user may only verify itself.</para>
+  </refsect1>
+
+  <refsect1>
+    <title>Commands</title>
+
+    <variablelist>
+      <varlistentry>
+        <term><command>verify</command> <optional><replaceable>REASON</replaceable></optional></term>
+        <listitem><para>Verify that the current user is present, optionally with a
+        human-readable <replaceable>REASON</replaceable>. Prints whether the user
+        was verified and the PAM service that ran.</para></listitem>
+      </varlistentry>
+    </variablelist>
+  </refsect1>
+
+  <refsect1>
+    <title>Options</title>
+
+    <variablelist>
+      <varlistentry>
+        <term><option>-h</option></term>
+        <term><option>--help</option></term>
+        <listitem><para>Print a short help text and exit.</para></listitem>
+      </varlistentry>
+    </variablelist>
+  </refsect1>
+
+  <refsect1>
+    <title>Exit status</title>
+    <para>0 is returned if the user was verified, a non-zero code otherwise.</para>
+  </refsect1>
+
+  <refsect1>
+    <title>Environment</title>
+
+    <variablelist>
+      <varlistentry>
+        <term><varname>$PLATFORMD_VERIFYD_RUNTIME</varname></term>
+        <listitem><para>The directory holding the
+        <constant>io.platformd.Verify</constant> socket. Defaults to
+        <filename>/run/platformd-verifyd</filename>.</para></listitem>
+      </varlistentry>
+    </variablelist>
+  </refsect1>
+
+  <refsect1>
+    <title>See Also</title>
+
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>platformd-verifyd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>platformd-trustd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+    </simplelist></para>
+  </refsect1>
+
+</refentry>

@@ -1,0 +1,117 @@
+<?xml version='1.0'?>
+<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
+
+<refentry id="platformd-verifyd.service" xmlns:xi="http://www.w3.org/2001/XInclude">
+
+  <refentryinfo>
+    <title>platformd-verifyd.service</title>
+    <productname>platformd</productname>
+  </refentryinfo>
+
+  <refmeta>
+    <refentrytitle>platformd-verifyd.service</refentrytitle>
+    <manvolnum>8</manvolnum>
+    <refmiscinfo class="source">platformd</refmiscinfo>
+    <refmiscinfo class="manual">platformd-verifyd</refmiscinfo>
+  </refmeta>
+
+  <refnamediv>
+    <refname>platformd-verifyd.service</refname>
+    <refname>platformd-verifyd</refname>
+    <refpurpose>User-presence verification service</refpurpose>
+  </refnamediv>
+
+  <refsynopsisdiv>
+    <para><filename>platformd-verifyd.service</filename></para>
+    <para><filename>/usr/libexec/platformd-verifyd</filename></para>
+  </refsynopsisdiv>
+
+  <refsect1>
+    <title>Description</title>
+
+    <para><filename>platformd-verifyd.service</filename> is a system service that
+    challenges a user to prove presence and records the result. On request it runs
+    the <filename>platformd-verify</filename> PAM stack for the calling user, and
+    on success reports the verification to
+    <citerefentry><refentrytitle>platformd-trustd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+    so the session's freshness reflects it. It is requested with
+    <citerefentry><refentrytitle>verifyctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>.</para>
+
+    <para>It is the challenger that complements the observer:
+    <citerefentry><refentrytitle>platformd-trustd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+    reports and attests the platform's authentication state, and this service
+    re-establishes user presence on demand when a policy that needs recent
+    verification has lapsed. It never asserts trust itself; it performs an
+    authentication and records that it happened.</para>
+
+    <para>The user verified is always the caller's own, taken from the peer
+    credentials of the connection rather than from a claimed name, so a process may
+    only verify itself. The service drives PAM and therefore runs privileged. It
+    announces readiness through
+    <citerefentry><refentrytitle>sd_notify</refentrytitle><manvolnum>3</manvolnum></citerefentry>
+    and terminates cleanly on <constant>SIGTERM</constant>.</para>
+  </refsect1>
+
+  <refsect1>
+    <title>The Varlink interface</title>
+
+    <para>The service exposes a single
+    <citerefentry><refentrytitle>varlink</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+    interface, <constant>io.platformd.Verify</constant>, on a
+    <constant>AF_UNIX</constant> socket at
+    <filename>/run/platformd-verifyd/io.platformd.Verify</filename>. Its one method,
+    <function>VerifyUser</function>, takes the session to refresh and a
+    human-readable reason, runs the PAM stack, and returns whether the user was
+    verified together with the PAM service that ran. On success the verification is
+    recorded with the trust authority. No secret material crosses the interface.</para>
+  </refsect1>
+
+  <refsect1>
+    <title>Factors</title>
+
+    <para>The factors offered are the <constant>auth</constant> lines of the
+    <filename>platformd-verify</filename> PAM stack
+    (<filename>/usr/lib/pam.d/platformd-verify</filename>, overridable under
+    <filename>/etc/pam.d/</filename>). Any PAM authentication module may be used —
+    fingerprint (<filename>pam_fprintd.so</filename>), face, a security key
+    (<filename>pam_u2f.so</filename>), or a password
+    (<filename>pam_unix.so</filename>); the service does not privilege any of them.
+    The first to succeed verifies presence.</para>
+
+    <para>Hardware factors are prompted by their own device — the reader or key is
+    the prompt — and need no interactive agent. A knowledge factor such as a
+    password requires a prompt to be rendered in the user's session, which needs a
+    prompt agent that is not yet available; such factors are declined until it is.
+    The reported method names the PAM service, not the individual factor.</para>
+  </refsect1>
+
+  <refsect1>
+    <title>Files</title>
+
+    <variablelist>
+      <varlistentry>
+        <term><filename>/run/platformd-verifyd/io.platformd.Verify</filename></term>
+        <listitem><para>The Varlink socket the service listens on.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><filename>/usr/lib/pam.d/platformd-verify</filename></term>
+        <listitem><para>The PAM stack naming the presence factors.</para></listitem>
+      </varlistentry>
+    </variablelist>
+  </refsect1>
+
+  <refsect1>
+    <title>See Also</title>
+
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>verifyctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>platformd-trustd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>pam</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-logind.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+    </simplelist></para>
+  </refsect1>
+
+</refentry>

@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    # Arch's libsystemd is current (>= 261); the sd-varlink / sd-json APIs the
+    # daemon uses require >= 257, which Ubuntu LTS runners do not ship.
+    container: archlinux:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitize: ['none', 'address,undefined']
+    name: build & test (sanitize=${{ matrix.sanitize }})
+    steps:
+      - name: Install toolchain and dependencies
+        run: |
+          pacman -Sy --noconfirm --needed archlinux-keyring
+          pacman -Syu --noconfirm --needed \
+            git base-devel meson ninja \
+            systemd pam \
+            libxslt docbook-xsl
+
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          extra=""
+          [ "${{ matrix.sanitize }}" != "none" ] && extra="-Db_sanitize=${{ matrix.sanitize }}"
+          meson setup build --prefix=/usr $extra
+
+      - name: Build
+        run: ninja -C build
+
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: meson test -C build --print-errorlogs

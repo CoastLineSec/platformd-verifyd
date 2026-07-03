@@ -1,0 +1,10 @@
+# meson / ninja build output
+/build/
+/build-*/
+/builddir/
+*.o
+*.a
+
+# never commit logs or local env
+*.log
+.env
