@@ -12,10 +12,17 @@
  * It owns the authentication: it drives PAM as root and reports the result
  * directly, so a step-up is one call, not a chain through polkit and a PAM module
  * smuggled into someone else's stack.
+ *
+ * The PAM conversation blocks for as long as the factor takes — a finger on the
+ * reader — so it runs in a forked worker, the way systemd-homed runs its blocking
+ * work, and the reply is sent when the worker exits. One verification runs at a
+ * time: a second request while one is in flight is refused Busy rather than
+ * queued invisibly against the same reader.
  */
 
 #include <errno.h>
 #include <pwd.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +33,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 
 #include <security/pam_appl.h>
 
@@ -40,6 +48,9 @@
 #define _cleanup_(f) __attribute__((cleanup(f)))
 static inline void freep(void *p) { free(*(void **) p); }
 #define _cleanup_free_ _cleanup_(freep)
+
+static sd_event *g_event;          /* for tracking the verification worker */
+static bool g_verify_inflight;     /* one verification at a time */
 
 static uint64_t now_real(void) {
         struct timespec ts;
@@ -75,19 +86,46 @@ static int conv_fn(int num_msg, const struct pam_message **msg,
 
 /* Record a successful verification with the trust authority over its Varlink
  * socket, as a raw exchange (verifyd runs as root, so the root-gated
- * SubmitAuthEvent accepts it). Best-effort: verification still stands if trustd
- * is not running. */
+ * SubmitAuthEvent accepts it). The request is built from a variant, so every
+ * field value is escaped. Best-effort: verification still stands if trustd is
+ * not running. */
 static void record_to_trustd(const char *user, uid_t uid, const char *session) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *params = NULL, *envelope = NULL;
+        _cleanup_free_ char *text = NULL;
         struct sockaddr_un sa = { .sun_family = AF_UNIX };
         struct timeval tv = { .tv_sec = 2 };
-        const char *sock;
-        char req[512];
+        const char *sock = getenv("PLATFORMD_TRUST_SOCKET");
+        const char *dir = getenv("PLATFORMD_TRUSTD_RUNTIME");
+        size_t tlen;
         int fd, len;
 
-        sock = getenv("PLATFORMD_TRUST_SOCKET");
-        if (!sock || !*sock)
-                sock = "/run/platformd-trustd/io.platformd.Trust";
-        strncpy(sa.sun_path, sock, sizeof sa.sun_path - 1);
+        /* Accept either an explicit socket path or a runtime directory. */
+        if (sock && *sock)
+                len = snprintf(sa.sun_path, sizeof sa.sun_path, "%s", sock);
+        else
+                len = snprintf(sa.sun_path, sizeof sa.sun_path, "%s/io.platformd.Trust",
+                               dir && *dir ? dir : "/run/platformd-trustd");
+        if (len < 0 || (size_t) len >= sizeof sa.sun_path)
+                return;
+
+        if (sd_json_buildo(&params,
+                SD_JSON_BUILD_PAIR("user", SD_JSON_BUILD_STRING(user)),
+                SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(uid)),
+                SD_JSON_BUILD_PAIR("pamService", SD_JSON_BUILD_STRING("platformd-verify")),
+                SD_JSON_BUILD_PAIR("tty", SD_JSON_BUILD_STRING("")),
+                SD_JSON_BUILD_PAIR("remoteHost", SD_JSON_BUILD_STRING("")),
+                SD_JSON_BUILD_PAIR("phase", SD_JSON_BUILD_STRING("verify")),
+                SD_JSON_BUILD_PAIR("declaredMethod", SD_JSON_BUILD_STRING("platformd-verify")),
+                SD_JSON_BUILD_PAIR("result", SD_JSON_BUILD_STRING("success")),
+                SD_JSON_BUILD_PAIR("sessionId", SD_JSON_BUILD_STRING(session ?: ""))) < 0)
+                return;
+        if (sd_json_buildo(&envelope,
+                SD_JSON_BUILD_PAIR("method", SD_JSON_BUILD_STRING("io.platformd.Trust.SubmitAuthEvent")),
+                SD_JSON_BUILD_PAIR("parameters", SD_JSON_BUILD_VARIANT(params))) < 0)
+                return;
+        if (sd_json_variant_format(envelope, 0, &text) < 0)
+                return;
+
         if ((fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0)
                 return;
         (void) setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
@@ -96,13 +134,8 @@ static void record_to_trustd(const char *user, uid_t uid, const char *session) {
                 close(fd);
                 return;
         }
-        len = snprintf(req, sizeof req,
-                "{\"method\":\"io.platformd.Trust.SubmitAuthEvent\",\"parameters\":{"
-                "\"user\":\"%s\",\"uid\":%u,\"pamService\":\"platformd-verify\",\"tty\":\"\","
-                "\"remoteHost\":\"\",\"phase\":\"verify\",\"declaredMethod\":\"platformd-verify\","
-                "\"result\":\"success\",\"sessionId\":\"%s\"}}",
-                user, (unsigned) uid, session);
-        if (len > 0 && len < (int) sizeof req && write(fd, req, (size_t) len + 1) == (ssize_t) len + 1)
+        tlen = strlen(text);
+        if (write(fd, text, tlen + 1) == (ssize_t) (tlen + 1))
                 for (;;) {   /* drain the reply so trustd's write completes */
                         char buf[256];
                         ssize_t n = read(fd, buf, sizeof buf);
@@ -112,24 +145,68 @@ static void record_to_trustd(const char *user, uid_t uid, const char *session) {
         close(fd);
 }
 
+/* A verification in flight: the pending Varlink call and what the worker is
+ * proving. Freed when the worker exits and the reply is sent. */
+typedef struct Verification {
+        sd_varlink *link;
+        sd_event_source *worker;
+        char *user;
+        char *session;
+        uid_t uid;
+} Verification;
+
+static void verification_free(Verification *v) {
+        if (!v)
+                return;
+        sd_event_source_disable_unref(v->worker);
+        sd_varlink_unref(v->link);
+        free(v->user);
+        free(v->session);
+        free(v);
+}
+
+static int on_verify_done(sd_event_source *s, const siginfo_t *si, void *userdata) {
+        Verification *v = userdata;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *result = NULL;
+        bool verified = si->si_code == CLD_EXITED && si->si_status == 0;
+
+        g_verify_inflight = false;
+        if (verified)
+                record_to_trustd(v->user, v->uid, v->session);
+        sd_journal_send("MESSAGE=presence verification %s", verified ? "succeeded" : "declined",
+                        "PLATFORMD_EVENT=verify-result",
+                        "PLATFORMD_VERIFY_USER=%s", v->user,
+                        "PLATFORMD_VERIFY_RESULT=%s", verified ? "success" : "failure", NULL);
+
+        if (sd_json_buildo(&result,
+                        SD_JSON_BUILD_PAIR("verified", SD_JSON_BUILD_BOOLEAN(verified)),
+                        SD_JSON_BUILD_PAIR("method", SD_JSON_BUILD_STRING("platformd-verify")),
+                        SD_JSON_BUILD_PAIR("realtimeUSec", SD_JSON_BUILD_UNSIGNED(now_real()))) >= 0)
+                (void) sd_varlink_reply(v->link, result);
+        else
+                (void) sd_varlink_error(v->link, "io.platformd.Verify.VerificationUnsupported", NULL);
+        verification_free(v);
+        return 0;
+}
+
 static int vl_verify_user(sd_varlink *link, sd_json_variant *parameters,
                           sd_varlink_method_flags_t flags, void *userdata) {
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *result = NULL;
         _cleanup_free_ char *display = NULL, *user = NULL;
-        struct pam_conv conv = { conv_fn, NULL };
-        pam_handle_t *pamh = NULL;
         const char *sid = "", *reason = "", *target = "";
+        Verification *v;
         struct passwd *pw;
         sd_json_variant *p;
         uid_t peer;
-        bool verified;
-        int r, rc;
+        pid_t pid;
 
         /* The user is the caller's own. Copy the name out of getpwuid()'s static
-         * buffer before PAM runs, since PAM may call getpw* itself and clobber it. */
+         * buffer up front. */
         if (sd_varlink_get_peer_uid(link, &peer) < 0 || !(pw = getpwuid(peer)) ||
             !(user = strdup(pw->pw_name)))
                 return sd_varlink_error(link, "io.platformd.Verify.PermissionDenied", NULL);
+
+        if (g_verify_inflight)
+                return sd_varlink_error(link, "io.platformd.Verify.Busy", NULL);
 
         if ((p = sd_json_variant_by_key(parameters, "sessionId")) && sd_json_variant_is_string(p))
                 sid = sd_json_variant_string(p);
@@ -137,7 +214,8 @@ static int vl_verify_user(sd_varlink *link, sd_json_variant *parameters,
                 reason = sd_json_variant_string(p);
 
         /* Refresh the named session only if it is the caller's; else their display
-         * session. verifyd resolves this so trustd always gets a valid session. */
+         * session. Without any resolvable session the verification would refresh
+         * nothing — decline up front rather than run a pointless authentication. */
         if (*sid) {
                 uid_t su;
                 if (sd_session_get_uid(sid, &su) >= 0 && su == peer)
@@ -145,37 +223,53 @@ static int vl_verify_user(sd_varlink *link, sd_json_variant *parameters,
         }
         if (!*target && sd_uid_get_display(peer, &display) >= 0)
                 target = display;
+        if (!target || !*target)
+                return sd_varlink_error(link, "io.platformd.Verify.NoSession", NULL);
 
         sd_journal_send("MESSAGE=presence verification requested",
                         "PLATFORMD_EVENT=verify-request",
                         "PLATFORMD_VERIFY_USER=%s", user,
                         "PLATFORMD_VERIFY_REASON=%s", reason, NULL);
 
-        /* Drive the platformd-verify PAM stack. Note: pam_authenticate is
-         * synchronous and blocks the event loop while the factor completes —
-         * acceptable for one verification at a time; making it async is a later
-         * hardening. */
-        r = pam_start("platformd-verify", user, &conv, &pamh);
-        if (r != PAM_SUCCESS)
+        /* The worker drives the platformd-verify PAM stack; its exit status
+         * carries the outcome. The event loop stays live throughout. */
+        pid = fork();
+        if (pid < 0)
                 return sd_varlink_error(link, "io.platformd.Verify.VerificationUnsupported", NULL);
-        rc = pam_authenticate(pamh, 0);
-        (void) pam_end(pamh, rc);
-        verified = rc == PAM_SUCCESS;
+        if (pid == 0) {
+                struct pam_conv conv = { conv_fn, NULL };
+                pam_handle_t *pamh = NULL;
+                sigset_t unblock;
+                int rc;
 
-        if (verified)
-                record_to_trustd(user, peer, target);
-        sd_journal_send("MESSAGE=presence verification %s", verified ? "succeeded" : "declined",
-                        "PLATFORMD_EVENT=verify-result",
-                        "PLATFORMD_VERIFY_USER=%s", user,
-                        "PLATFORMD_VERIFY_RESULT=%s", verified ? "success" : "failure", NULL);
+                sigfillset(&unblock);
+                sigprocmask(SIG_UNBLOCK, &unblock, NULL);
+                if (pam_start("platformd-verify", user, &conv, &pamh) != PAM_SUCCESS)
+                        _exit(2);
+                rc = pam_authenticate(pamh, 0);
+                (void) pam_end(pamh, rc);
+                _exit(rc == PAM_SUCCESS ? 0 : 1);
+        }
 
-        r = sd_json_buildo(&result,
-                SD_JSON_BUILD_PAIR("verified", SD_JSON_BUILD_BOOLEAN(verified)),
-                SD_JSON_BUILD_PAIR("method", SD_JSON_BUILD_STRING("platformd-verify")),
-                SD_JSON_BUILD_PAIR("realtimeUSec", SD_JSON_BUILD_UNSIGNED(now_real())));
-        if (r < 0)
-                return r;
-        return sd_varlink_reply(link, result);
+        if (!(v = calloc(1, sizeof *v))) {
+                kill(pid, SIGKILL);
+                (void) waitpid(pid, NULL, 0);
+                return -ENOMEM;
+        }
+        v->link = sd_varlink_ref(link);
+        v->uid = peer;
+        v->user = user;
+        user = NULL;
+        v->session = strdup(target);
+        if (!v->session ||
+            sd_event_add_child(g_event, &v->worker, pid, WEXITED, on_verify_done, v) < 0) {
+                kill(pid, SIGKILL);
+                (void) waitpid(pid, NULL, 0);
+                verification_free(v);
+                return sd_varlink_error(link, "io.platformd.Verify.VerificationUnsupported", NULL);
+        }
+        g_verify_inflight = true;
+        return 0;   /* the reply is sent when the worker exits */
 }
 
 static int setup_varlink(sd_varlink_server *server, sd_event *event) {
@@ -194,6 +288,7 @@ static int setup_varlink(sd_varlink_server *server, sd_event *event) {
 
         if ((r = sd_varlink_server_bind_method(server, "io.platformd.Verify.VerifyUser", vl_verify_user)) < 0)
                 return r;
+        (void) unlink(addr);   /* clear a stale socket from a prior run */
         if ((r = sd_varlink_server_listen_address(server, addr, 0666)) < 0)
                 return r;
         return sd_varlink_server_attach_event(server, event, 0);
@@ -209,9 +304,11 @@ int main(int argc, char *argv[]) {
                 sd_journal_print(LOG_ERR, "sd_event_default: %s", strerror(-r));
                 return EXIT_FAILURE;
         }
+        g_event = event;
         sigemptyset(&ss);
         sigaddset(&ss, SIGTERM);
         sigaddset(&ss, SIGINT);
+        sigaddset(&ss, SIGCHLD);   /* required for tracking the worker */
         sigprocmask(SIG_BLOCK, &ss, NULL);
         (void) sd_event_add_signal(event, NULL, SIGTERM, NULL, NULL);
         (void) sd_event_add_signal(event, NULL, SIGINT, NULL, NULL);

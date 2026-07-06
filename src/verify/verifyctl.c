@@ -25,14 +25,19 @@ static int cmd_verify(const char *reason) {
         _cleanup_(sd_varlink_unrefp) sd_varlink *link = NULL;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *params = NULL, *reply = NULL;
         _cleanup_free_ char *addr = NULL, *session = NULL;
-        const char *dir = getenv("PLATFORMD_VERIFYD_RUNTIME"), *err = NULL;
+        const char *sock = getenv("PLATFORMD_VERIFY_SOCKET");
+        const char *dir = getenv("PLATFORMD_VERIFYD_RUNTIME");
+        const char *err = NULL;
         sd_json_variant *v;
         bool verified;
         int r;
 
-        if (!dir || !*dir)
-                dir = "/run/platformd-verifyd";
-        if (asprintf(&addr, "%s/io.platformd.Verify", dir) < 0)
+        /* Accept either an explicit socket path or a runtime directory. */
+        if (sock && *sock) {
+                if (!(addr = strdup(sock)))
+                        return EXIT_FAILURE;
+        } else if (asprintf(&addr, "%s/io.platformd.Verify",
+                            dir && *dir ? dir : "/run/platformd-verifyd") < 0)
                 return EXIT_FAILURE;
         if (sd_varlink_connect_address(&link, addr) < 0) {
                 fprintf(stderr, "verifyctl: no verification service is running (%s)\n", addr);

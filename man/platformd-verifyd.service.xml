@@ -66,6 +66,11 @@
     human-readable reason, runs the PAM stack, and returns whether the user was
     verified together with the PAM service that ran. On success the verification is
     recorded with the trust authority. No secret material crosses the interface.</para>
+
+    <para>The PAM conversation runs in a forked worker, so a factor that waits at
+    the reader does not block the service. One verification runs at a time: a
+    concurrent call is refused with <constant>Busy</constant>, and a call with no
+    resolvable session is refused with <constant>NoSession</constant>.</para>
   </refsect1>
 
   <refsect1>

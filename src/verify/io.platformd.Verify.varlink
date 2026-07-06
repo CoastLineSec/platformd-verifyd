@@ -10,9 +10,13 @@ interface io.platformd.Verify
 # credentials, never a claimed name), so a process may only verify itself. On
 # success the verification is recorded with platformd-trustd, so the session's
 # freshness reflects it. sessionId names the session to refresh (the caller's
-# display session is used if it is empty or does not belong to the caller);
-# reason is a short human-readable purpose. Requires privilege — the daemon drives
-# PAM. verified is the outcome, method the PAM service that ran.
+# display session is used if it is empty or does not belong to the caller); with
+# no resolvable session the call fails NoSession, since the verification would
+# refresh nothing. reason is a short human-readable purpose. The PAM conversation
+# runs in a worker and the reply arrives when the factor completes; one
+# verification runs at a time — a concurrent request is refused Busy rather than
+# queued against the same reader. verified is the outcome, method the PAM service
+# that ran.
 method VerifyUser(
         sessionId: string,
         reason: string
@@ -24,3 +28,5 @@ method VerifyUser(
 
 error PermissionDenied()
 error VerificationUnsupported()
+error NoSession()
+error Busy()
