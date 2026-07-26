@@ -68,8 +68,10 @@
     recorded with the trust authority. No secret material crosses the interface.</para>
 
     <para>The PAM conversation runs in a forked worker, so a factor that waits at
-    the reader does not block the service. One verification runs at a time: a
-    concurrent call is refused with <constant>Busy</constant>, and a call with no
+    the reader does not block the service. One verification runs for each user at
+    a time, with a bounded number across the machine. A concurrent call for the
+    same user is refused with <constant>Busy</constant>. The worker is terminated
+    when its client disconnects or after the service deadline. A call with no
     resolvable session is refused with <constant>NoSession</constant>.</para>
   </refsect1>
 

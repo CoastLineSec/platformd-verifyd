@@ -56,8 +56,10 @@ available.
 The daemon runs the `platformd-verify` PAM stack for the calling user and, on
 success, records the verification with platformd-trustd so the session's freshness
 reflects it. The PAM conversation runs in a forked worker, so the reader never
-blocks the event loop; one verification runs at a time (a concurrent request is
-refused `Busy`), and a request with no resolvable session is refused `NoSession`.
+blocks the event loop. Requests are serialized per user and bounded across the
+machine; an abandoned request is cancelled, and a worker that exceeds the
+service deadline is terminated. A request with no resolvable session is refused
+`NoSession`.
 Fingerprint, face, and security-key factors work agent-free; password/PIN needs the
 prompt agent (a planned addition). The service is requested over the
 `io.platformd.Verify` Varlink interface and with `verifyctl`.

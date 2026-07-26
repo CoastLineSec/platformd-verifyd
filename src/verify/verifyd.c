@@ -15,9 +15,9 @@
  *
  * The PAM conversation blocks for as long as the factor takes — a finger on the
  * reader — so it runs in a forked worker, the way systemd-homed runs its blocking
- * work, and the reply is sent when the worker exits. One verification runs at a
- * time: a second request while one is in flight is refused Busy rather than
- * queued invisibly against the same reader.
+ * work, and the reply is sent when the worker exits. Requests are serialized per
+ * user and bounded globally. A worker is cancelled when its client disconnects
+ * or the verification deadline expires.
  */
 
 #include <errno.h>
@@ -49,8 +49,14 @@
 static inline void freep(void *p) { free(*(void **) p); }
 #define _cleanup_free_ _cleanup_(freep)
 
-static sd_event *g_event;          /* for tracking the verification worker */
-static bool g_verify_inflight;     /* one verification at a time */
+typedef struct Verification Verification;
+
+static sd_event *g_event;
+static Verification *g_verifications;
+static unsigned g_n_verifications;
+static uint64_t g_verify_timeout = 120 * 1000000ULL;
+
+#define VERIFY_MAX_INFLIGHT 8
 
 static uint64_t now_real(void) {
         struct timespec ts;
@@ -147,18 +153,42 @@ static void record_to_trustd(const char *user, uid_t uid, const char *session) {
 
 /* A verification in flight: the pending Varlink call and what the worker is
  * proving. Freed when the worker exits and the reply is sent. */
-typedef struct Verification {
+struct Verification {
+        Verification *next;
         sd_varlink *link;
         sd_event_source *worker;
+        sd_event_source *timeout;
         char *user;
         char *session;
         uid_t uid;
-} Verification;
+        pid_t pid;
+        bool client_gone;
+        bool timed_out;
+};
+
+static Verification *verification_for_uid(uid_t uid) {
+        for (Verification *v = g_verifications; v; v = v->next)
+                if (v->uid == uid)
+                        return v;
+
+        return NULL;
+}
 
 static void verification_free(Verification *v) {
+        Verification **p;
+
         if (!v)
                 return;
+
+        for (p = &g_verifications; *p; p = &(*p)->next)
+                if (*p == v) {
+                        *p = v->next;
+                        g_n_verifications--;
+                        break;
+                }
+
         sd_event_source_disable_unref(v->worker);
+        sd_event_source_disable_unref(v->timeout);
         sd_varlink_unref(v->link);
         free(v->user);
         free(v->session);
@@ -169,24 +199,55 @@ static int on_verify_done(sd_event_source *s, const siginfo_t *si, void *userdat
         Verification *v = userdata;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *result = NULL;
         bool verified = si->si_code == CLD_EXITED && si->si_status == 0;
+        const char *outcome;
 
-        g_verify_inflight = false;
-        if (verified)
+        if (v->timed_out)
+                outcome = "timeout";
+        else if (verified)
+                outcome = "success";
+        else
+                outcome = "failure";
+
+        if (verified && !v->timed_out && !v->client_gone)
                 record_to_trustd(v->user, v->uid, v->session);
-        sd_journal_send("MESSAGE=presence verification %s", verified ? "succeeded" : "declined",
+        sd_journal_send("MESSAGE=presence verification finished",
                         "PLATFORMD_EVENT=verify-result",
                         "PLATFORMD_VERIFY_USER=%s", v->user,
-                        "PLATFORMD_VERIFY_RESULT=%s", verified ? "success" : "failure", NULL);
+                        "PLATFORMD_VERIFY_RESULT=%s", outcome, NULL);
 
-        if (sd_json_buildo(&result,
-                        SD_JSON_BUILD_PAIR("verified", SD_JSON_BUILD_BOOLEAN(verified)),
-                        SD_JSON_BUILD_PAIR("method", SD_JSON_BUILD_STRING("platformd-verify")),
-                        SD_JSON_BUILD_PAIR("realtimeUSec", SD_JSON_BUILD_UNSIGNED(now_real()))) >= 0)
-                (void) sd_varlink_reply(v->link, result);
-        else
-                (void) sd_varlink_error(v->link, "io.platformd.Verify.VerificationUnsupported", NULL);
+        if (!v->client_gone) {
+                if (v->timed_out)
+                        (void) sd_varlink_error(v->link, "io.platformd.Verify.VerificationTimedOut", NULL);
+                else if (sd_json_buildo(&result,
+                                SD_JSON_BUILD_PAIR("verified", SD_JSON_BUILD_BOOLEAN(verified)),
+                                SD_JSON_BUILD_PAIR("method", SD_JSON_BUILD_STRING("platformd-verify")),
+                                SD_JSON_BUILD_PAIR("realtimeUSec", SD_JSON_BUILD_UNSIGNED(now_real()))) >= 0)
+                        (void) sd_varlink_reply(v->link, result);
+                else
+                        (void) sd_varlink_error(v->link, "io.platformd.Verify.VerificationUnsupported", NULL);
+        }
         verification_free(v);
         return 0;
+}
+
+static int on_verify_timeout(sd_event_source *s, uint64_t usec, void *userdata) {
+        Verification *v = userdata;
+
+        v->timed_out = true;
+        if (v->pid > 0)
+                (void) kill(v->pid, SIGKILL);
+        return 0;
+}
+
+static void on_disconnect(sd_varlink_server *server, sd_varlink *link, void *userdata) {
+        for (Verification *v = g_verifications; v; v = v->next)
+                if (v->link == link) {
+                        v->client_gone = true;
+                        v->link = sd_varlink_unref(v->link);
+                        if (v->pid > 0)
+                                (void) kill(v->pid, SIGKILL);
+                        break;
+                }
 }
 
 static int vl_verify_user(sd_varlink *link, sd_json_variant *parameters,
@@ -205,7 +266,7 @@ static int vl_verify_user(sd_varlink *link, sd_json_variant *parameters,
             !(user = strdup(pw->pw_name)))
                 return sd_varlink_error(link, "io.platformd.Verify.PermissionDenied", NULL);
 
-        if (g_verify_inflight)
+        if (verification_for_uid(peer) || g_n_verifications >= VERIFY_MAX_INFLIGHT)
                 return sd_varlink_error(link, "io.platformd.Verify.Busy", NULL);
 
         if ((p = sd_json_variant_by_key(parameters, "sessionId")) && sd_json_variant_is_string(p))
@@ -258,17 +319,22 @@ static int vl_verify_user(sd_varlink *link, sd_json_variant *parameters,
         }
         v->link = sd_varlink_ref(link);
         v->uid = peer;
+        v->pid = pid;
         v->user = user;
         user = NULL;
         v->session = strdup(target);
         if (!v->session ||
-            sd_event_add_child(g_event, &v->worker, pid, WEXITED, on_verify_done, v) < 0) {
+            sd_event_add_child(g_event, &v->worker, pid, WEXITED, on_verify_done, v) < 0 ||
+            sd_event_add_time_relative(g_event, &v->timeout, CLOCK_BOOTTIME,
+                                       g_verify_timeout, 0, on_verify_timeout, v) < 0) {
                 kill(pid, SIGKILL);
                 (void) waitpid(pid, NULL, 0);
                 verification_free(v);
                 return sd_varlink_error(link, "io.platformd.Verify.VerificationUnsupported", NULL);
         }
-        g_verify_inflight = true;
+        v->next = g_verifications;
+        g_verifications = v;
+        g_n_verifications++;
         return 0;   /* the reply is sent when the worker exits */
 }
 
@@ -286,7 +352,8 @@ static int setup_varlink(sd_varlink_server *server, sd_event *event) {
         if (asprintf(&addr, "%s/io.platformd.Verify", dir) < 0)
                 return -ENOMEM;
 
-        if ((r = sd_varlink_server_bind_method(server, "io.platformd.Verify.VerifyUser", vl_verify_user)) < 0)
+        if ((r = sd_varlink_server_bind_method(server, "io.platformd.Verify.VerifyUser", vl_verify_user)) < 0 ||
+            (r = sd_varlink_server_bind_disconnect(server, on_disconnect)) < 0)
                 return r;
         (void) unlink(addr);   /* clear a stale socket from a prior run */
         if ((r = sd_varlink_server_listen_address(server, addr, 0666)) < 0)
@@ -298,6 +365,7 @@ int main(int argc, char *argv[]) {
         _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *server = NULL;
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         sigset_t ss;
+        const char *timeout;
         int r;
 
         if ((r = sd_event_default(&event)) < 0) {
@@ -305,6 +373,16 @@ int main(int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
         g_event = event;
+        timeout = getenv("PLATFORMD_VERIFY_TIMEOUT_SEC");
+        if (timeout && *timeout) {
+                char *end = NULL;
+                unsigned long seconds;
+
+                errno = 0;
+                seconds = strtoul(timeout, &end, 10);
+                if (errno == 0 && end && *end == 0 && seconds > 0 && seconds <= 600)
+                        g_verify_timeout = seconds * 1000000ULL;
+        }
         sigemptyset(&ss);
         sigaddset(&ss, SIGTERM);
         sigaddset(&ss, SIGINT);
@@ -328,5 +406,14 @@ int main(int argc, char *argv[]) {
         sd_journal_print(LOG_INFO, "platformd-verifyd started");
 
         r = sd_event_loop(event);
+
+        while (g_verifications) {
+                Verification *v = g_verifications;
+
+                if (v->pid > 0)
+                        (void) kill(v->pid, SIGKILL);
+                (void) waitpid(v->pid, NULL, 0);
+                verification_free(v);
+        }
         return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
