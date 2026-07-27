@@ -2,7 +2,7 @@
 # would build them (libsystemd + meson). `platformd` is a placeholder for
 # `systemd`: the rename test is `s/platformd/systemd/`.
 project('platformd', 'c',
-        version : '0.1.1',
+        version : '0.1.2',
         license : 'LGPL-2.1-or-later',
         meson_version : '>= 1.1',
         default_options : [
