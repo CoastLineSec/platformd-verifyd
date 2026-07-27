@@ -1,6 +1,17 @@
 platformd-verifyd NEWS
 ======================
 
+platformd-verifyd 0.1.2
+
+  * Verification is serialized per UID instead of across the entire machine,
+    with a global limit of eight workers.
+  * Workers have a CLOCK_BOOTTIME deadline of 120 seconds, configurable from 1
+    to 600 seconds with PLATFORMD_VERIFY_TIMEOUT_SEC. A deadline terminates the
+    worker and returns the new VerificationTimedOut Varlink error.
+  * Disconnecting the requesting Varlink client terminates its worker,
+    suppresses the success event to platformd-trustd, and releases the per-UID
+    slot.
+
 platformd-verifyd 0.1.1
 
   Audit hardening:
