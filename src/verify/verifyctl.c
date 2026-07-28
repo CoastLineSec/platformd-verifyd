@@ -1,11 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
-/*
- * verifyctl — request a presence verification from platformd-verifyd.
- *
- * `verifyctl verify [REASON]` runs the platformd-verify PAM stack for the current
- * user (touch the fingerprint reader, look at the camera, …) and prints the
- * outcome. A Varlink client of io.platformd.Verify.
- */
+/* verifyctl requests presence verification from platformd-verifyd. */
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -23,12 +17,12 @@ static inline void freep(void *p) { free(*(void **) p); }
 
 static int cmd_verify(const char *reason) {
         _cleanup_(sd_varlink_unrefp) sd_varlink *link = NULL;
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *params = NULL, *reply = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *params = NULL;
         _cleanup_free_ char *addr = NULL, *session = NULL;
         const char *sock = getenv("PLATFORMD_VERIFY_SOCKET");
         const char *dir = getenv("PLATFORMD_VERIFYD_RUNTIME");
         const char *err = NULL;
-        sd_json_variant *v;
+        sd_json_variant *reply = NULL, *v;
         bool verified;
         int r;
 
@@ -50,7 +44,7 @@ static int cmd_verify(const char *reason) {
                         SD_JSON_BUILD_PAIR("reason", SD_JSON_BUILD_STRING(reason ?: "verification requested"))) < 0)
                 return EXIT_FAILURE;
 
-        printf("Prove your presence (touch the reader / look at the camera)…\n");
+        printf("Verify user presence with the configured factor.\n");
         r = sd_varlink_call(link, "io.platformd.Verify.VerifyUser", params, &reply, &err);
         if (r < 0) {
                 fprintf(stderr, "verifyctl: call failed: %s\n", strerror(-r));
@@ -75,7 +69,7 @@ int main(int argc, char *argv[]) {
         if (streq(cmd, "verify"))
                 return cmd_verify(argc > 2 ? argv[2] : NULL);
         if (streq(cmd, "-h") || streq(cmd, "--help") || streq(cmd, "help")) {
-                printf("verifyctl — request a presence verification\n\n"
+                printf("verifyctl: request a presence verification\n\n"
                        "  verifyctl verify [REASON]   Prove the current user is present\n");
                 return EXIT_SUCCESS;
         }

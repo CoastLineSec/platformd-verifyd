@@ -32,24 +32,24 @@
     <title>Description</title>
 
     <para><filename>platformd-verifyd.service</filename> is a system service that
-    challenges a user to prove presence and records the result. On request it runs
-    the <filename>platformd-verify</filename> PAM stack for the calling user, and
-    on success reports the verification to
+    verifies the presence of the calling user. On request it runs the
+    <filename>platformd-verify</filename> PAM stack. On success it submits the
+    result to
     <citerefentry><refentrytitle>platformd-trustd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-    so the session's freshness reflects it. It is requested with
+    when that service is available. Completion of this best-effort submission
+    does not affect the verification result. Requests may be made with
     <citerefentry><refentrytitle>verifyctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>.</para>
 
-    <para>It is the challenger that complements the observer:
-    <citerefentry><refentrytitle>platformd-trustd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-    reports and attests the platform's authentication state, and this service
-    re-establishes user presence on demand when a policy that needs recent
-    verification has lapsed. It never asserts trust itself; it performs an
-    authentication and records that it happened.</para>
-
     <para>The user verified is always the caller's own, taken from the peer
-    credentials of the connection rather than from a claimed name, so a process may
-    only verify itself. The service drives PAM and therefore runs privileged. It
-    announces readiness through
+    credentials of the connection rather than from a claimed name. The target
+    must be an active, local, logind-reported unlocked session owned by that
+    user. An explicitly named session is never replaced by another session. If
+    no session is named, the service uses the caller's eligible session. If the
+    caller is not associated with a session, the service selects the only
+    eligible session for the caller.</para>
+
+    <para>The service drives PAM and therefore runs privileged. It announces
+    readiness through
     <citerefentry><refentrytitle>sd_notify</refentrytitle><manvolnum>3</manvolnum></citerefentry>
     and terminates cleanly on <constant>SIGTERM</constant>.</para>
   </refsect1>
@@ -64,15 +64,25 @@
     <filename>/run/platformd-verifyd/io.platformd.Verify</filename>. Its one method,
     <function>VerifyUser</function>, takes the session to refresh and a
     human-readable reason, runs the PAM stack, and returns whether the user was
-    verified together with the PAM service that ran. On success the verification is
-    recorded with the trust authority. No secret material crosses the interface.</para>
+    verified together with the PAM service that ran. The reason is descriptive
+    text supplied by the client. It is not a verified application identity.
+    Authentication responses do not cross this interface.</para>
 
     <para>The PAM conversation runs in a forked worker, so a factor that waits at
     the reader does not block the service. One verification runs for each user at
     a time, with a bounded number across the machine. A concurrent call for the
     same user is refused with <constant>Busy</constant>. The worker is terminated
-    when its client disconnects or after the service deadline. A call with no
-    resolvable session is refused with <constant>NoSession</constant>.</para>
+    when its client disconnects, the target session becomes ineligible, or the
+    service deadline expires.</para>
+
+    <para><constant>NoSession</constant> is returned if no logind session can be
+    resolved. <constant>AmbiguousSession</constant> is returned if more than one
+    eligible session remains. <constant>SessionNotEligible</constant> is returned
+    if an explicitly named session is not eligible.
+    <constant>PromptUnavailable</constant> reports that a compatible password
+    agent could not accept a prompt. <constant>VerificationTimedOut</constant>
+    and <constant>VerificationCancelled</constant> report deadline and
+    cancellation failures.</para>
   </refsect1>
 
   <refsect1>
@@ -81,17 +91,22 @@
     <para>The factors offered are the <constant>auth</constant> lines of the
     <filename>platformd-verify</filename> PAM stack
     (<filename>/usr/lib/pam.d/platformd-verify</filename>, overridable under
-    <filename>/etc/pam.d/</filename>). Any PAM authentication module may be used —
-    fingerprint (<filename>pam_fprintd.so</filename>), face, a security key
-    (<filename>pam_u2f.so</filename>), or a password
-    (<filename>pam_unix.so</filename>); the service does not privilege any of them.
-    The first to succeed verifies presence.</para>
+    <filename>/etc/pam.d/</filename>). The vendor stack uses
+    <filename>pam_fprintd.so</filename>. Administrators may configure other PAM
+    authentication modules. The first successful module verifies presence.</para>
 
-    <para>Hardware factors are prompted by their own device — the reader or key is
-    the prompt — and need no interactive agent. A knowledge factor such as a
-    password requires a prompt to be rendered in the user's session, which needs a
-    prompt agent that is not yet available; such factors are declined until it is.
-    The reported method names the PAM service, not the individual factor.</para>
+    <para>PAM password and PIN prompts are sent to the per-user
+    <constant>io.systemd.AskPassword</constant> Varlink service. Prompt caching
+    is disabled. The target session must provide a compatible systemd password
+    agent for an interactive prompt to succeed. The prompt identifies
+    platformd-verifyd and labels the client-supplied request description. It
+    does not assert an application identity or a trusted graphical origin.
+    Replies are returned only to PAM and are erased after use. Informational
+    and error messages are written to the journal without authentication
+    responses.</para>
+
+    <para>The reported method names the PAM service, not the individual PAM
+    module that accepted the authentication.</para>
   </refsect1>
 
   <refsect1>

@@ -16,8 +16,8 @@ platformd-verifyd 0.1.1
 
   Audit hardening:
 
-  * The PAM conversation runs in a forked worker (as systemd-homed runs its
-    blocking work), so a finger on the reader no longer blocks the event loop.
+  * The PAM conversation runs in a forked worker, so a finger on the reader no
+    longer blocks the event loop.
     The Varlink reply is sent when the worker exits.
   * One verification runs at a time: a concurrent VerifyUser is refused with the
     Busy error rather than queued invisibly against the same reader.
@@ -29,14 +29,10 @@ platformd-verifyd 0.1.1
 
 platformd-verifyd 0.1.0
 
-  * First release of the user-presence verification service — the challenger in
+  * First release of the user-presence verification service, the challenger in
     platform authentication. Over the Varlink interface io.platformd.Verify it
-    runs the platformd-verify PAM stack (fingerprint, face, security key, …) for
+    runs the platformd-verify PAM stack for
     the calling user and, on success, records the verification with
     platformd-trustd so the session's freshness reflects it. The user is always
     the caller's own, taken from the peer credentials. verifyctl(1) drives it.
     Factor-agnostic: the factors are PAM modules the administrator stacks.
-
-  Versioning: the 0.x series is pre-release. The 1.0 tag is gated on an
-  independent security review. The password prompt agent (for knowledge factors)
-  is a planned addition.

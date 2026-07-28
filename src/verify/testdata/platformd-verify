@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+auth required pam_exec.so /usr/bin/sleep 0.5
+auth required pam_permit.so

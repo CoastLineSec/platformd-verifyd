@@ -1,6 +1,4 @@
-# platformd — Linux-first platform-authentication components, built as systemd
-# would build them (libsystemd + meson). `platformd` is a placeholder for
-# `systemd`: the rename test is `s/platformd/systemd/`.
+# platformd Linux platform-authentication components.
 project('platformd', 'c',
         version : '0.1.2',
         license : 'LGPL-2.1-or-later',
@@ -14,12 +12,12 @@ project('platformd', 'c',
 # as errors (Varlink method handlers take a fixed signature).
 add_project_arguments('-D_GNU_SOURCE', '-Wno-unused-parameter', language : 'c')
 
-libsystemd = dependency('libsystemd', version : '>= 257')
+libsystemd = dependency('libsystemd', version : '>= 258')
 
 subdir('src/verify')
 subdir('man')
 
-# --- installed integration: the systemd system unit
+# Install the system unit.
 conf = configuration_data()
 conf.set('LIBEXECDIR', get_option('prefix') / get_option('libexecdir'))
 

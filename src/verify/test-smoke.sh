@@ -1,11 +1,11 @@
 #!/bin/sh
-# Smoke test: the daemon starts and serves io.platformd.Verify, and a verification
-# with no enrolled factor returns cleanly (not verified) rather than crashing or
-# hanging. The interactive factors themselves are validated by hand.
+# Exercise daemon startup, request validation, and worker cleanup.
 set -u
 
 VERIFYD="$1"
 VERIFYCTL="$2"
+PLATFORMD_VERIFY_PAM_CONFDIR="$3"
+export PLATFORMD_VERIFY_PAM_CONFDIR
 PLATFORMD_VERIFYD_RUNTIME="$(mktemp -d)"
 export PLATFORMD_VERIFYD_RUNTIME
 PLATFORMD_VERIFY_TIMEOUT_SEC=2
@@ -20,11 +20,25 @@ i=0
 while [ ! -S "$SOCK" ] && [ "$i" -lt 100 ]; do i=$((i + 1)); sleep 0.05; done
 [ -S "$SOCK" ] || { echo "FAIL: Varlink socket was not created"; exit 1; }
 
-# No enrolled factor -> a clean "not verified", not a hang or crash. The timeout
-# guards against a misconfigured PAM stack blocking the test.
-timeout 15 "$VERIFYCTL" verify "smoke test" >/dev/null 2>&1 || true
+fail() { echo "FAIL: $*"; exit 1; }
 
-# Abandon a request and verify that its worker does not retain the per-user slot.
+if command -v varlinkctl >/dev/null 2>&1; then
+        R=$(varlinkctl call "$SOCK" io.platformd.Verify.VerifyUser \
+                '{"sessionId":"","reason":1}' 2>&1 || true)
+        echo "$R" | grep -q '"parameter":"reason"' \
+                || fail "invalid reason was not rejected: $R"
+
+        R=$(varlinkctl call "$SOCK" io.platformd.Verify.VerifyUser \
+                '{"sessionId":"no-such-session","reason":"test"}' 2>&1 || true)
+        echo "$R" | grep -q 'SessionNotEligible' \
+                || fail "unknown explicit session was not rejected: $R"
+fi
+
+R=$(timeout 15 "$VERIFYCTL" verify "smoke test" 2>&1) \
+        || fail "verification with the test PAM stack failed: $R"
+echo "$R" | grep -q 'verified: yes' \
+        || fail "verification with the test PAM stack did not succeed: $R"
+
 timeout 0.05 "$VERIFYCTL" verify "disconnect test" >/dev/null 2>&1 || true
 i=0
 while [ "$i" -lt 40 ]; do

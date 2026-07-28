@@ -2,21 +2,19 @@
 [Unit]
 Description=platformd user-presence verification service
 Documentation=man:platformd-verifyd.service(8)
-After=platformd-trustd.service
-Wants=platformd-trustd.service
 
 [Service]
 Type=notify
 ExecStart=@LIBEXECDIR@/platformd-verifyd
 RuntimeDirectory=platformd-verifyd
 RuntimeDirectoryMode=0755
+LimitCORE=0
 
-# The service drives PAM, whose factor backends reach hardware — the fingerprint
-# reader (via fprintd on the system bus), a camera, a security key. NoNewPrivileges
-# is left off because a PAM module may need a privileged helper. The hardening
-# below suits local hardware factors; a factor that needs the network or writes
-# state outside the runtime directory may require relaxing ProtectSystem or
-# RestrictAddressFamilies.
+# The service drives PAM, whose factor backends reach hardware such as a
+# fingerprint reader, camera, or security key. NoNewPrivileges is left off
+# because a PAM module may need a privileged helper. A factor that needs the
+# network or writes state outside the runtime directory may require relaxing
+# ProtectSystem or RestrictAddressFamilies.
 NoNewPrivileges=no
 ProtectSystem=strict
 ProtectKernelTunables=yes

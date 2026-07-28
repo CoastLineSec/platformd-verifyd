@@ -1,16 +1,12 @@
 # platformd-verifyd presence-verification stack.
 #
 # platformd-verifyd runs only the auth phase of this stack to prove a user is
-# present. List the factors you want offered; the first to succeed verifies
-# presence. The factors below are agent-free — the device is the prompt — so no
-# UI is needed. A password factor would need the prompt agent and is intentionally
-# not enabled here.
+# present. List the factors to offer; the first successful factor verifies
+# presence. PAM conversation prompts are forwarded to a systemd password agent.
 #
-# Enrol a fingerprint with `fprintd-enroll` before relying on pam_fprintd.
+# Enroll a fingerprint with fprintd-enroll before using pam_fprintd.
 
 auth       sufficient   pam_fprintd.so
-#auth      sufficient   pam_howdy.so      # face; presence-grade on a non-IR camera
-#auth      sufficient   pam_u2f.so        # security key (cue=yes for a touch prompt)
 auth       required     pam_deny.so
 
 account    required     pam_permit.so

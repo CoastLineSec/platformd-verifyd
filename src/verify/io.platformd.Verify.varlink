@@ -5,19 +5,19 @@
 interface io.platformd.Verify
 
 # Challenge the calling user to prove presence now by running the platformd-verify
-# PAM stack — fingerprint, face, security key or password, whatever the
-# administrator configured. The user is the caller's own (taken from the peer
-# credentials, never a claimed name), so a process may only verify itself. On
-# success the verification is recorded with platformd-trustd, so the session's
-# freshness reflects it. sessionId names the session to refresh (the caller's
-# display session is used if it is empty or does not belong to the caller); with
-# no resolvable session the call fails NoSession, since the verification would
-# refresh nothing. reason is a short human-readable purpose. The PAM conversation
-# runs in a worker and the reply arrives when the factor completes. One request
-# per user may run at a time, with a bounded number across the machine. A request
-# is cancelled when its client disconnects and fails VerificationTimedOut if the
-# PAM stack does not finish within the service deadline. verified is the outcome,
-# method the PAM service that ran.
+# PAM stack, using whichever factors the administrator configured. The
+# user is the caller's own (taken from the peer credentials, never a claimed
+# name), so a process may only verify itself. On
+# success the verification may be recorded with platformd-trustd. sessionId
+# names an active, local, logind-reported unlocked user session owned by the
+# caller. If it is empty, the peer process session is used, or exactly one
+# eligible session is selected. An invalid explicit session is not replaced by
+# another session. reason is bounded descriptive text and does not identify a
+# trusted client. The PAM conversation runs in a worker and the reply arrives
+# when the factor completes. One request per user may run at a time, with a
+# bounded number across the machine. The request is cancelled when its client
+# disconnects or the target session becomes ineligible. verified is the outcome,
+# and method is the PAM service that ran.
 method VerifyUser(
         sessionId: string,
         reason: string
@@ -30,5 +30,9 @@ method VerifyUser(
 error PermissionDenied()
 error VerificationUnsupported()
 error VerificationTimedOut()
+error VerificationCancelled()
+error PromptUnavailable()
 error NoSession()
+error SessionNotEligible()
+error AmbiguousSession()
 error Busy()

@@ -37,7 +37,7 @@
     <para><command>verifyctl</command> asks
     <citerefentry><refentrytitle>platformd-verifyd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
     to verify that the current user is present, by running the configured factors
-    (touch the fingerprint reader, look at the camera, …). It is a client of the
+    in the <filename>platformd-verify</filename> PAM service. It is a client of the
     <constant>io.platformd.Verify</constant>
     <citerefentry><refentrytitle>varlink</refentrytitle><manvolnum>7</manvolnum></citerefentry>
     interface. A user may only verify itself.</para>

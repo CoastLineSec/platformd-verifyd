@@ -1,68 +1,33 @@
 # platformd-verifyd
 
-platformd-verifyd is a user-presence verification service for Linux systems — it
-challenges a user to prove presence now (fingerprint, face, security key, or
-password) and records the result with the platform trust authority. It is a
-component of platformd (see `centricd-os`), written in C against libsystemd
-(sd-event, sd-varlink, sd-json, sd-login) and libpam, and built with meson.
-
-It is the challenger in platform authentication: platformd-trustd observes and
-attests the platform's authentication state, and platformd-verifyd re-establishes
-user presence on demand when that state has gone stale. A process may only verify
-its own user — the user is taken from the caller's credentials, never a claimed
-name.
-
-It provides two programs:
-
-| Program | Role |
-| --- | --- |
-| `platformd-verifyd` | the daemon; serves the `io.platformd.Verify` Varlink interface |
-| `verifyctl` | command-line client to request a verification |
+platformd-verifyd verifies the presence of the calling user through a
+configured PAM stack. It associates each request with an active, local,
+logind-reported unlocked user session. Authentication responses are exchanged
+with a systemd password agent and are never returned to the client. A
+successful result may be submitted to platformd-trustd when it is available.
 
 ## Requirements
 
-- libsystemd ≥ 257 — sd-event, sd-varlink, sd-json, sd-login
-- libpam — drives the configured authentication factors
-- meson ≥ 1.1, ninja, and a C11 compiler
-- the factor backends you enable — e.g. `fprintd` (fingerprint), Howdy (face), `pam-u2f` (security key)
+- libsystemd 258 or newer
+- Linux PAM
+- Meson 1.1 or newer
+- a C11 compiler
 
 ## Build
 
 ```sh
 meson setup build --prefix=/usr
-ninja -C build
+meson compile -C build
+meson test -C build
 sudo meson install -C build
 sudo systemctl enable --now platformd-verifyd.service
 ```
 
-`--prefix=/usr` installs the daemon under `/usr/lib`, `verifyctl` in `/usr/bin`,
-and the PAM stack where PAM looks for it (`/usr/lib/pam.d/platformd-verify`).
+The installed PAM service is `platformd-verify`. The default stack uses
+`pam_fprintd.so`. Administrators may override the vendor stack in
+`/etc/pam.d/platformd-verify`.
 
-## Factors
-
-The factors offered are configured in the `platformd-verify` PAM stack
-(`/usr/lib/pam.d/platformd-verify`, overridable under `/etc/pam.d/`). Fingerprint
-is enabled by default; face (Howdy) and security key are one line each. Enrol a
-fingerprint with `fprintd-enroll` first. Hardware factors are agent-free — the
-device is the prompt; a password factor needs the prompt agent, which is not yet
-available.
-
-## Documentation
-
-- `platformd-verifyd.service(8)` and `verifyctl(1)` — the manual pages.
-
-## Status
-
-The daemon runs the `platformd-verify` PAM stack for the calling user and, on
-success, records the verification with platformd-trustd so the session's freshness
-reflects it. The PAM conversation runs in a forked worker, so the reader never
-blocks the event loop. Requests are serialized per user and bounded across the
-machine; an abandoned request is cancelled, and a worker that exceeds the
-service deadline is terminated. A request with no resolvable session is refused
-`NoSession`.
-Fingerprint, face, and security-key factors work agent-free; password/PIN needs the
-prompt agent (a planned addition). The service is requested over the
-`io.platformd.Verify` Varlink interface and with `verifyctl`.
+See `platformd-verifyd.service(8)` and `verifyctl(1)` for details.
 
 ## License
 

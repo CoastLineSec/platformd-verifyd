@@ -1,5 +1,4 @@
-# platformd-verifyd — user-presence verification service.
-# (Sources live in src/verify/, as systemd keeps src/login/, src/home/, etc.)
+# platformd-verifyd user-presence verification service.
 
 cc = meson.get_compiler('c')
 libpam = cc.find_library('pam')
@@ -7,6 +6,7 @@ libpam = cc.find_library('pam')
 verifyd = executable(
         'platformd-verifyd',
         'verifyd.c',
+        'verify-util.c',
         dependencies : [libsystemd, libpam],
         install : true,
         install_dir : get_option('libexecdir'),
@@ -19,7 +19,19 @@ verifyctl = executable(
         install : true,
 )
 
-# --- tests (meson test) ---
+# Tests.
+test_conversation = executable(
+        'test-conversation',
+        'test-conversation.c',
+        'verify-util.c',
+        dependencies : [libsystemd, libpam],
+)
+test('conversation', test_conversation)
 test('smoke', find_program('sh'),
-     args : [meson.current_source_dir() / 'test-smoke.sh', verifyd, verifyctl],
+     args : [
+             meson.current_source_dir() / 'test-smoke.sh',
+             verifyd,
+             verifyctl,
+             meson.current_source_dir() / 'testdata',
+     ],
      timeout : 60)
