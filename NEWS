@@ -1,6 +1,31 @@
 platformd-verifyd NEWS
 ======================
 
+CHANGES WITH 0.1.3:
+
+        * VerifyUser requests are now bound to an active, local, unlocked
+          logind session owned by the calling user. Explicit session IDs are
+          never replaced with another session. Missing, ambiguous, and
+          ineligible sessions return distinct Varlink errors.
+
+        * PAM password and PIN prompts are now forwarded to the systemd
+          password-agent multiplexer in the user's runtime directory. Cached
+          responses are disabled, replies are treated as sensitive data, and
+          PAM response buffers are erased after use.
+
+        * A verification is cancelled when its client disconnects, its target
+          session disappears or becomes ineligible, or its deadline expires.
+          Cancellation and timeout failures are reported separately.
+
+        * Successful verification results are submitted asynchronously to
+          platformd-trustd. An unavailable trust service does not change the
+          PAM result returned to the requester.
+
+        * Unknown explicit session IDs are now rejected as
+          SessionNotEligible even when the system bus is unavailable.
+          The smoke test uses an isolated test session and no longer depends on
+          a logind instance in the build environment.
+
 platformd-verifyd 0.1.2
 
   * Verification is serialized per UID instead of across the entire machine,

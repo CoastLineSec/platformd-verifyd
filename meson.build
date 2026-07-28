@@ -1,6 +1,6 @@
 # platformd Linux platform-authentication components.
 project('platformd', 'c',
-        version : '0.1.2',
+        version : '0.1.3',
         license : 'LGPL-2.1-or-later',
         meson_version : '>= 1.1',
         default_options : [
