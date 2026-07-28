@@ -73,6 +73,14 @@ static TrustSubmission *g_submissions;
 static unsigned g_n_verifications;
 static uint64_t g_verify_timeout = 120U * 1000000U;
 
+#ifdef VERIFYD_TESTING
+static const char *test_session_id(void) {
+        const char *session = getenv("PLATFORMD_VERIFY_TEST_SESSION");
+
+        return session && *session ? session : NULL;
+}
+#endif
+
 static uint64_t now_real(void) {
         struct timespec ts;
 
@@ -122,10 +130,24 @@ static int session_eligible(const char *session, uid_t uid, char **ret_path) {
         uid_t owner;
         int active, locked, remote, r;
 
-        if (!session || !*session || !g_bus)
-                return -ENOTCONN;
+        if (!session || !*session)
+                return -EINVAL;
+#ifdef VERIFYD_TESTING
+        const char *test_session = test_session_id();
+
+        if (test_session && streq(session, test_session)) {
+                if (ret_path) {
+                        *ret_path = strdup("/org/freedesktop/login1/session/platformd_test");
+                        if (!*ret_path)
+                                return -ENOMEM;
+                }
+                return 1;
+        }
+#endif
         if (sd_session_get_uid(session, &owner) < 0 || owner != uid)
                 return 0;
+        if (!g_bus)
+                return -ENOTCONN;
         active = sd_session_is_active(session);
         remote = sd_session_is_remote(session);
         if (active < 0 || remote < 0)
@@ -171,6 +193,23 @@ static int select_session(
 
         *ret_session = NULL;
         *ret_path = NULL;
+
+#ifdef VERIFYD_TESTING
+        const char *test_session = test_session_id();
+
+        if (test_session &&
+            (!requested || !*requested || streq(requested, test_session))) {
+                *ret_session = strdup(test_session);
+                *ret_path = strdup("/org/freedesktop/login1/session/platformd_test");
+                if (!*ret_session || !*ret_path) {
+                        free(*ret_session);
+                        free(*ret_path);
+                        *ret_session = *ret_path = NULL;
+                        return -ENOMEM;
+                }
+                return 0;
+        }
+#endif
 
         if (requested && *requested) {
                 r = session_eligible(requested, uid, &path);
@@ -511,6 +550,13 @@ static int worker_run(uid_t uid, const char *user, const char *reason) {
 
 static int prepare_monitor(Verification *v) {
         int r;
+
+#ifdef VERIFYD_TESTING
+        const char *test_session = test_session_id();
+
+        if (test_session && streq(v->session, test_session))
+                return 0;
+#endif
 
         r = sd_bus_match_signal(
                         g_bus,

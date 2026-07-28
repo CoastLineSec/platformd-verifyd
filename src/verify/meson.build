@@ -12,6 +12,14 @@ verifyd = executable(
         install_dir : get_option('libexecdir'),
 )
 
+verifyd_test = executable(
+        'platformd-verifyd-test',
+        'verifyd.c',
+        'verify-util.c',
+        c_args : ['-DVERIFYD_TESTING'],
+        dependencies : [libsystemd, libpam],
+)
+
 verifyctl = executable(
         'verifyctl',
         'verifyctl.c',
@@ -30,7 +38,7 @@ test('conversation', test_conversation)
 test('smoke', find_program('sh'),
      args : [
              meson.current_source_dir() / 'test-smoke.sh',
-             verifyd,
+             verifyd_test,
              verifyctl,
              meson.current_source_dir() / 'testdata',
      ],
