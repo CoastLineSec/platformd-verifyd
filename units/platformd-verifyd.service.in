@@ -9,6 +9,7 @@ ExecStart=@LIBEXECDIR@/platformd-verifyd
 RuntimeDirectory=platformd-verifyd
 RuntimeDirectoryMode=0755
 LimitCORE=0
+KillMode=control-group
 
 # The service drives PAM, whose factor backends reach hardware such as a
 # fingerprint reader, camera, or security key. NoNewPrivileges is left off

@@ -68,12 +68,22 @@
     text supplied by the client. It is not a verified application identity.
     Authentication responses do not cross this interface.</para>
 
-    <para>The PAM conversation runs in a forked worker, so a factor that waits at
+    <para>The PAM conversation runs in a supervised worker, so a factor that waits at
     the reader does not block the service. One verification runs for each user at
     a time, with a bounded number across the machine. A concurrent call for the
     same user is refused with <constant>Busy</constant>. The worker is terminated
     when its client disconnects, the target session becomes ineligible, or the
-    service deadline expires.</para>
+    service deadline expires. Remaining forked descendants are terminated and
+    reaped before the request completes or its concurrency slot is released.
+    This includes helpers that create separate process sessions.</para>
+
+    <para>The supervisor uses the procfs children interface to collect orphaned
+    descendants. It does not run PAM and closes inherited descriptors other
+    than standard input, output, and error.
+    The PAM worker re-executes the service binary before loading the stack, so
+    libraries do not retain stale descriptor state from the daemon.
+    Service-wide termination uses the systemd control group. Worker supervision
+    is a lifetime boundary, not a sandbox for privileged PAM modules.</para>
 
     <para><constant>NoSession</constant> is returned if no logind session can be
     resolved. <constant>AmbiguousSession</constant> is returned if more than one
@@ -93,7 +103,10 @@
     (<filename>/usr/lib/pam.d/platformd-verify</filename>, overridable under
     <filename>/etc/pam.d/</filename>). The vendor stack uses
     <filename>pam_fprintd.so</filename>. Administrators may configure other PAM
-    authentication modules. The first successful module verifies presence.</para>
+    authentication modules. PAM control flags determine the final authentication
+    result. A successful stack result is not overridden by an earlier
+    conversation failure. Request cancellation and the service deadline remain
+    independent of that result.</para>
 
     <para>PAM password and PIN prompts are sent to the per-user
     <constant>io.systemd.AskPassword</constant> Varlink service. Prompt caching
@@ -101,7 +114,9 @@
     agent for an interactive prompt to succeed. The prompt identifies
     platformd-verifyd and labels the client-supplied request description. It
     does not assert an application identity or a trusted graphical origin.
-    Replies are returned only to PAM and are erased after use. Informational
+    Replies are returned only to PAM. The Varlink input is marked sensitive
+    before reception, and response copies owned by verifyd are erased before
+    release. PAM owns the responses delivered to its modules. Informational
     and error messages are written to the journal without authentication
     responses.</para>
 

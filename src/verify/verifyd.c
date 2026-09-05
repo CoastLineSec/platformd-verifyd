@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "verify-util.h"
+#include "verify-worker.h"
 
 #include <errno.h>
 #include <pwd.h>
@@ -316,7 +317,7 @@ static void verification_cancel(Verification *v) {
 
         v->cancelled = true;
         if (v->pid > 0)
-                (void) kill(v->pid, SIGKILL);
+                (void) kill(v->pid, SIGTERM);
 }
 
 static int on_session_properties(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -501,7 +502,7 @@ static int on_verify_timeout(sd_event_source *source, uint64_t usec, void *userd
 
         v->timed_out = true;
         if (v->pid > 0)
-                (void) kill(v->pid, SIGKILL);
+                (void) kill(v->pid, SIGTERM);
         return 0;
 }
 
@@ -511,7 +512,7 @@ static void on_disconnect(sd_varlink_server *server, sd_varlink *link, void *use
                         v->client_gone = true;
                         v->link = sd_varlink_unref(v->link);
                         if (v->pid > 0)
-                                (void) kill(v->pid, SIGKILL);
+                                (void) kill(v->pid, SIGTERM);
                         break;
                 }
 }
@@ -538,6 +539,8 @@ static int worker_run(uid_t uid, const char *user, const char *reason) {
 
         r = pam_authenticate(pamh, 0);
         (void) pam_end(pamh, r);
+        if (r == PAM_SUCCESS)
+                return EXIT_SUCCESS;
         if (context.prompt_status == VERIFY_PROMPT_TIMED_OUT)
                 return WORKER_PROMPT_TIMED_OUT;
         if (context.prompt_status == VERIFY_PROMPT_CANCELLED)
@@ -545,7 +548,7 @@ static int worker_run(uid_t uid, const char *user, const char *reason) {
         if (context.prompt_status == VERIFY_PROMPT_UNAVAILABLE ||
             context.prompt_status == VERIFY_PROMPT_PROTOCOL_ERROR)
                 return WORKER_PROMPT_UNAVAILABLE;
-        return r == PAM_SUCCESS ? EXIT_SUCCESS : WORKER_AUTH_FAILED;
+        return WORKER_AUTH_FAILED;
 }
 
 static int prepare_monitor(Verification *v) {
@@ -654,7 +657,7 @@ static int vl_verify_user(
                         "PLATFORMD_VERIFY_REASON=%s", reason,
                         NULL);
 
-        pid = fork();
+        pid = verify_worker_fork();
         if (pid < 0) {
                 verification_free(v);
                 return sd_varlink_error(
@@ -663,11 +666,12 @@ static int vl_verify_user(
                                 NULL);
         }
         if (pid == 0) {
-                sigset_t unblock;
+                char uid[32];
 
-                sigfillset(&unblock);
-                (void) sigprocmask(SIG_UNBLOCK, &unblock, NULL);
-                _exit(worker_run(peer, v->user, reason));
+                /* Reinitialize library state after closing inherited descriptors. */
+                snprintf(uid, sizeof uid, "%u", (unsigned) peer);
+                execl("/proc/self/exe", "platformd-verifyd", "--pam-worker", uid, v->user, reason, NULL);
+                _exit(WORKER_SETUP_FAILED);
         }
         v->pid = pid;
 
@@ -680,8 +684,9 @@ static int vl_verify_user(
                             0,
                             on_verify_timeout,
                             v) < 0) {
-                (void) kill(pid, SIGKILL);
-                (void) waitpid(pid, NULL, 0);
+                (void) kill(pid, SIGTERM);
+                while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+                        ;
                 verification_free(v);
                 return sd_varlink_error(
                                 link,
@@ -730,15 +735,9 @@ int main(int argc, char *argv[]) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         const char *timeout;
+        struct sigaction action = { .sa_handler = SIG_DFL };
         sigset_t signals;
         int r;
-
-        r = sd_event_default(&event);
-        if (r < 0) {
-                sd_journal_print(LOG_ERR, "Failed to allocate event loop: %s", strerror(-r));
-                return EXIT_FAILURE;
-        }
-        g_event = event;
 
         timeout = getenv("PLATFORMD_VERIFY_TIMEOUT_SEC");
         if (timeout && *timeout) {
@@ -751,13 +750,45 @@ int main(int argc, char *argv[]) {
                         g_verify_timeout = seconds * 1000000U;
         }
 
+        if (argc > 1 && streq(argv[1], "--pam-worker")) {
+                unsigned long uid;
+                char *end;
+
+                if (argc != 5 || !argv[2][0] || !argv[3][0] ||
+                    !verify_text_valid(argv[4], VERIFY_REASON_MAX))
+                        return WORKER_SETUP_FAILED;
+                errno = 0;
+                uid = strtoul(argv[2], &end, 10);
+                if (errno != 0 || *end || uid >= (uid_t) -1 ||
+                    (getuid() != 0 && uid != getuid()))
+                        return WORKER_SETUP_FAILED;
+                return worker_run((uid_t) uid, argv[3], argv[4]);
+        }
+
+        r = sd_event_default(&event);
+        if (r < 0) {
+                sd_journal_print(LOG_ERR, "Failed to allocate event loop: %s", strerror(-r));
+                return EXIT_FAILURE;
+        }
+        g_event = event;
+
         sigemptyset(&signals);
         sigaddset(&signals, SIGTERM);
         sigaddset(&signals, SIGINT);
         sigaddset(&signals, SIGCHLD);
-        (void) sigprocmask(SIG_BLOCK, &signals, NULL);
-        (void) sd_event_add_signal(event, NULL, SIGTERM, NULL, NULL);
-        (void) sd_event_add_signal(event, NULL, SIGINT, NULL, NULL);
+        sigemptyset(&action.sa_mask);
+        if (sigprocmask(SIG_BLOCK, &signals, NULL) < 0 ||
+            sigaction(SIGCHLD, &action, NULL) < 0 ||
+            sigaction(SIGTERM, &action, NULL) < 0 ||
+            sigaction(SIGINT, &action, NULL) < 0) {
+                sd_journal_print(LOG_ERR, "Failed to configure verification signals: %m");
+                return EXIT_FAILURE;
+        }
+        if ((r = sd_event_add_signal(event, NULL, SIGTERM, NULL, NULL)) < 0 ||
+            (r = sd_event_add_signal(event, NULL, SIGINT, NULL, NULL)) < 0) {
+                sd_journal_print(LOG_ERR, "Failed to install termination handlers: %s", strerror(-r));
+                return EXIT_FAILURE;
+        }
 
         r = sd_bus_open_system(&bus);
         if (r >= 0)
@@ -789,12 +820,14 @@ int main(int argc, char *argv[]) {
 
         r = sd_event_loop(event);
 
+        for (Verification *v = g_verifications; v; v = v->next)
+                if (v->pid > 0)
+                        (void) kill(v->pid, SIGTERM);
         while (g_verifications) {
                 Verification *v = g_verifications;
 
-                if (v->pid > 0)
-                        (void) kill(v->pid, SIGKILL);
-                (void) waitpid(v->pid, NULL, 0);
+                while (waitpid(v->pid, NULL, 0) < 0 && errno == EINTR)
+                        ;
                 verification_free(v);
         }
         while (g_submissions)

@@ -123,6 +123,10 @@ static int ask_password(
                 return r;
         }
 
+        r = sd_varlink_set_input_sensitive(link);
+        if (r < 0)
+                return r;
+
         r = sd_varlink_call(link, "io.systemd.AskPassword.Ask",
                             parameters, &reply, &error_id);
         if (reply)

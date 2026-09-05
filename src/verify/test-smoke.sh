@@ -2,6 +2,11 @@
 # Exercise daemon startup, request validation, and worker cleanup.
 set -u
 
+if [ "${1-}" != --test-inner ]; then
+        exec sh "$(dirname "$0")/test-env.sh" sh "$0" --test-inner "$@"
+fi
+shift
+
 VERIFYD="$1"
 VERIFYCTL="$2"
 PLATFORMD_VERIFY_PAM_CONFDIR="$3"
@@ -13,10 +18,23 @@ export PLATFORMD_VERIFY_TIMEOUT_SEC
 PLATFORMD_VERIFY_TEST_SESSION=test-session
 export PLATFORMD_VERIFY_TEST_SESSION
 SOCK="$PLATFORMD_VERIFYD_RUNTIME/io.platformd.Verify"
+PLATFORMD_VERIFY_SOCKET="$SOCK"
+export PLATFORMD_VERIFY_SOCKET
+
+PID=
+cleanup() {
+        if [ -n "$PID" ]; then
+                kill -TERM "$PID" 2>/dev/null || :
+                wait "$PID" 2>/dev/null || :
+        fi
+        rm -rf -- "$PLATFORMD_VERIFYD_RUNTIME"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 "$VERIFYD" >/dev/null 2>&1 &
 PID=$!
-trap 'kill -TERM $PID 2>/dev/null; wait $PID 2>/dev/null; rm -rf "$PLATFORMD_VERIFYD_RUNTIME"' EXIT
 
 i=0
 while [ ! -S "$SOCK" ] && [ "$i" -lt 100 ]; do i=$((i + 1)); sleep 0.05; done
