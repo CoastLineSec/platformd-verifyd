@@ -22,6 +22,12 @@ PLATFORMD_VERIFY_SOCKET="$SOCK"
 export PLATFORMD_VERIFY_SOCKET
 
 PID=
+timeout 1 "$VERIFYD" --help | grep -q platformd-verifyd || exit 1
+timeout 1 "$VERIFYD" --version | grep -q platformd-verifyd || exit 1
+if timeout 1 "$VERIFYD" --invalid-option >/dev/null 2>&1; then
+        exit 1
+fi
+[ ! -e "$SOCK" ] || exit 1
 cleanup() {
         if [ -n "$PID" ]; then
                 kill -TERM "$PID" 2>/dev/null || :
@@ -43,6 +49,23 @@ while [ ! -S "$SOCK" ] && [ "$i" -lt 100 ]; do i=$((i + 1)); sleep 0.05; done
 fail() { echo "FAIL: $*"; exit 1; }
 
 if command -v varlinkctl >/dev/null 2>&1; then
+        varlinkctl info "$SOCK" | grep -q platformd-verifyd || fail 'service information unavailable'
+        normalize_idl() {
+                awk '
+                        { sub(/#.*/, "") }
+                        /^[[:space:]]*(interface|type|method|error)[[:space:]]/ { if (s != "") print s; s = "" }
+                        { gsub(/[[:space:]]/, ""); s = s $0 }
+                        END { if (s != "") print s }
+                ' | sort
+        }
+        published=$(varlinkctl introspect "$SOCK" io.platformd.Verify | normalize_idl)
+        expected=$(normalize_idl < "$(dirname "$0")/io.platformd.Verify.varlink")
+        [ "$published" = "$expected" ] || fail 'published interface does not match its definition'
+        inode=$(stat -c %i "$SOCK")
+        if "$VERIFYD" >/dev/null 2>&1; then
+                fail 'duplicate daemon accepted'
+        fi
+        [ "$(stat -c %i "$SOCK")" = "$inode" ] || fail 'duplicate daemon replaced the socket'
         R=$(varlinkctl call "$SOCK" io.platformd.Verify.VerifyUser \
                 '{"sessionId":"","reason":1}' 2>&1 || true)
         echo "$R" | grep -q '"parameter":"reason"' \

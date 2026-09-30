@@ -130,7 +130,7 @@ static sd_varlink *start_request(const char *socket_path, Reply *reply) {
 
 static bool slot_busy(const char *socket_path) {
         sd_varlink *link = NULL;
-        sd_json_variant *reply = NULL, *parameter;
+        sd_json_variant *reply = NULL;
         const char *error_id = NULL;
         bool busy;
 
@@ -141,14 +141,12 @@ static bool slot_busy(const char *socket_path) {
                         "io.platformd.Verify.VerifyUser",
                         &reply,
                         &error_id,
-                        SD_JSON_BUILD_PAIR_STRING("sessionId", "test-session")) >= 0);
+                        SD_JSON_BUILD_PAIR_STRING("sessionId", "no-such-session"),
+                        SD_JSON_BUILD_PAIR_STRING("reason", "slot availability")) >= 0);
         check(error_id);
         busy = strcmp(error_id, "io.platformd.Verify.Busy") == 0;
-        if (!busy) {
-                parameter = sd_json_variant_by_key(reply, "parameter");
-                check(parameter && sd_json_variant_is_string(parameter));
-                check(strcmp(sd_json_variant_string(parameter), "reason") == 0);
-        }
+        if (!busy)
+                check(strcmp(error_id, "io.platformd.Verify.SessionNotEligible") == 0);
         sd_varlink_unref(link);
         return busy;
 }

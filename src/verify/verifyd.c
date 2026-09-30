@@ -2,8 +2,10 @@
 
 #include "verify-util.h"
 #include "verify-worker.h"
+#include "varlink-interface.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -13,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <sys/wait.h>
 
 #include <security/pam_appl.h>
@@ -51,11 +54,16 @@ struct Verification {
         sd_event_source *timeout;
         sd_bus_slot *properties_slot;
         sd_bus_slot *removed_slot;
+        sd_bus_slot *validation_slot;
         char *user;
+        char *reason;
         char *session;
         char *session_path;
         uid_t uid;
         pid_t pid;
+        uint64_t deadline_usec;
+        int result_status;
+        bool worker_finished;
         bool client_gone;
         bool timed_out;
         bool cancelled;
@@ -69,10 +77,14 @@ struct TrustSubmission {
 
 static sd_event *g_event;
 static sd_bus *g_bus;
+static int g_listener_lock = -1;
 static Verification *g_verifications;
 static TrustSubmission *g_submissions;
 static unsigned g_n_verifications;
 static uint64_t g_verify_timeout = 120U * 1000000U;
+static void verification_complete(Verification *verification);
+static int verification_launch(Verification *verification);
+static int verification_validate(Verification *verification);
 
 #ifdef VERIFYD_TESTING
 static const char *test_session_id(void) {
@@ -89,6 +101,14 @@ static uint64_t now_real(void) {
         return (uint64_t) ts.tv_sec * 1000000U + (uint64_t) ts.tv_nsec / 1000U;
 }
 
+static bool verification_expired(Verification *v) {
+        struct timespec ts;
+
+        if (clock_gettime(CLOCK_BOOTTIME, &ts) < 0)
+                return true;
+        return (uint64_t) ts.tv_sec * 1000000U + ts.tv_nsec / 1000U >= v->deadline_usec;
+}
+
 static void strv_free(char **l) {
         if (!l)
                 return;
@@ -98,38 +118,11 @@ static void strv_free(char **l) {
         free(l);
 }
 
-static int session_path(const char *session, char **ret) {
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        const char *path;
-        int r;
-
-        *ret = NULL;
-        if (!g_bus)
-                return -ENOTCONN;
-
-        r = sd_bus_call_method(
-                        g_bus,
-                        "org.freedesktop.login1",
-                        "/org/freedesktop/login1",
-                        "org.freedesktop.login1.Manager",
-                        "GetSession",
-                        NULL,
-                        &reply,
-                        "s",
-                        session);
-        if (r < 0)
-                return r;
-        r = sd_bus_message_read(reply, "o", &path);
-        if (r < 0)
-                return r;
-        *ret = strdup(path);
-        return *ret ? 0 : -ENOMEM;
-}
 
 static int session_eligible(const char *session, uid_t uid, char **ret_path) {
         _cleanup_free_ char *class = NULL, *path = NULL;
         uid_t owner;
-        int active, locked, remote, r;
+        int active, remote, r;
 
         if (!session || !*session)
                 return -EINVAL;
@@ -147,8 +140,6 @@ static int session_eligible(const char *session, uid_t uid, char **ret_path) {
 #endif
         if (sd_session_get_uid(session, &owner) < 0 || owner != uid)
                 return 0;
-        if (!g_bus)
-                return -ENOTCONN;
         active = sd_session_is_active(session);
         remote = sd_session_is_remote(session);
         if (active < 0 || remote < 0)
@@ -159,24 +150,13 @@ static int session_eligible(const char *session, uid_t uid, char **ret_path) {
                 return -EIO;
         if (!verify_session_class_allowed(class))
                 return 0;
-        if ((r = session_path(session, &path)) < 0)
-                return r;
-        r = sd_bus_get_property_trivial(
-                        g_bus,
-                        "org.freedesktop.login1",
-                        path,
-                        "org.freedesktop.login1.Session",
-                        "LockedHint",
-                        NULL,
-                        'b',
-                        &locked);
-        if (r < 0)
-                return r;
-        if (locked)
-                return 0;
-
-        if (ret_path)
-                *ret_path = path, path = NULL;
+        if (ret_path) {
+                r = sd_bus_path_encode("/org/freedesktop/login1/session", session, &path);
+                if (r < 0)
+                        return r;
+                *ret_path = path;
+                path = NULL;
+        }
         return 1;
 }
 
@@ -304,8 +284,10 @@ static void verification_free(Verification *v) {
         sd_event_source_disable_unref(v->timeout);
         sd_bus_slot_unref(v->properties_slot);
         sd_bus_slot_unref(v->removed_slot);
+        sd_bus_slot_unref(v->validation_slot);
         sd_varlink_unref(v->link);
         free(v->user);
+        free(v->reason);
         free(v->session);
         free(v->session_path);
         free(v);
@@ -318,13 +300,47 @@ static void verification_cancel(Verification *v) {
         v->cancelled = true;
         if (v->pid > 0)
                 (void) kill(v->pid, SIGTERM);
+        else
+                verification_complete(v);
 }
 
 static int on_session_properties(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         Verification *v = userdata;
+        const char *interface, *name;
+        int locked = -1, r;
+        bool invalidated = false;
 
-        if (session_eligible(v->session, v->uid, NULL) != 1)
-                verification_cancel(v);
+        if (sd_bus_message_read(message, "s", &interface) <= 0)
+                goto cancel;
+        if (!streq(interface, "org.freedesktop.login1.Session"))
+                return 0;
+        if (sd_bus_message_enter_container(message, 'a', "{sv}") <= 0)
+                goto cancel;
+        while ((r = sd_bus_message_enter_container(message, 'e', "sv")) > 0) {
+                if (sd_bus_message_read(message, "s", &name) <= 0)
+                        goto cancel;
+                if (streq(name, "LockedHint")) {
+                        if (locked >= 0 || sd_bus_message_enter_container(message, 'v', "b") <= 0 ||
+                            sd_bus_message_read(message, "b", &locked) <= 0 ||
+                            sd_bus_message_exit_container(message) < 0)
+                                goto cancel;
+                } else if (sd_bus_message_skip(message, "v") < 0)
+                        goto cancel;
+                if (sd_bus_message_exit_container(message) < 0)
+                        goto cancel;
+        }
+        if (r < 0 || sd_bus_message_exit_container(message) < 0 ||
+            sd_bus_message_enter_container(message, 'a', "s") <= 0)
+                goto cancel;
+        while ((r = sd_bus_message_read(message, "s", &name)) > 0)
+                invalidated |= streq(name, "LockedHint");
+        if (r < 0 || sd_bus_message_exit_container(message) < 0 ||
+            sd_bus_message_at_end(message, true) <= 0 || locked > 0 || invalidated ||
+            session_eligible(v->session, v->uid, NULL) != 1)
+                goto cancel;
+        return 0;
+cancel:
+        verification_cancel(v);
         return 0;
 }
 
@@ -332,7 +348,7 @@ static int on_session_removed(sd_bus_message *message, void *userdata, sd_bus_er
         Verification *v = userdata;
         const char *id, *path;
 
-        if (sd_bus_message_read(message, "so", &id, &path) >= 0 &&
+        if (sd_bus_message_read(message, "so", &id, &path) > 0 &&
             (streq(id, v->session) || streq(path, v->session_path)))
                 verification_cancel(v);
         return 0;
@@ -424,17 +440,17 @@ static void submit_to_trustd(const char *user, uid_t uid, const char *session) {
         g_submissions = submission;
 }
 
-static int on_verify_done(sd_event_source *source, const siginfo_t *si, void *userdata) {
-        Verification *v = userdata;
+static void verification_complete(Verification *v) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *result = NULL;
         bool verified;
         const char *outcome;
-        int status;
+        int status = v->result_status;
 
-        status = si->si_code == CLD_EXITED ? si->si_status : WORKER_AUTH_FAILED;
+        v->timed_out |= verification_expired(v);
         if (!v->timed_out && !v->cancelled &&
             session_eligible(v->session, v->uid, NULL) != 1)
                 v->cancelled = true;
+        v->timed_out |= verification_expired(v);
         verified = status == EXIT_SUCCESS && !v->timed_out && !v->cancelled;
 
         if (v->timed_out || status == WORKER_PROMPT_TIMED_OUT)
@@ -494,6 +510,20 @@ static int on_verify_done(sd_event_source *source, const siginfo_t *si, void *us
         if (verified && !v->client_gone)
                 submit_to_trustd(v->user, v->uid, v->session);
         verification_free(v);
+}
+
+static int on_verify_done(sd_event_source *source, const siginfo_t *si, void *userdata) {
+        Verification *v = userdata;
+
+        v->worker = sd_event_source_unref(v->worker);
+        v->pid = 0;
+        v->worker_finished = true;
+        v->result_status = si->si_code == CLD_EXITED ? si->si_status : WORKER_AUTH_FAILED;
+        v->timed_out |= verification_expired(v);
+        if (v->timed_out || v->cancelled || v->client_gone || v->result_status != EXIT_SUCCESS)
+                verification_complete(v);
+        else if (verification_validate(v) < 0)
+                verification_cancel(v);
         return 0;
 }
 
@@ -503,6 +533,8 @@ static int on_verify_timeout(sd_event_source *source, uint64_t usec, void *userd
         v->timed_out = true;
         if (v->pid > 0)
                 (void) kill(v->pid, SIGTERM);
+        else
+                verification_complete(v);
         return 0;
 }
 
@@ -513,6 +545,8 @@ static void on_disconnect(sd_varlink_server *server, sd_varlink *link, void *use
                         v->link = sd_varlink_unref(v->link);
                         if (v->pid > 0)
                                 (void) kill(v->pid, SIGTERM);
+                        else
+                                verification_free(v);
                         break;
                 }
 }
@@ -527,8 +561,13 @@ static int worker_run(uid_t uid, const char *user, const char *reason) {
         struct pam_conv conversation = { verify_pam_conversation, &context };
         const char *confdir;
         pam_handle_t *pamh = NULL;
+        struct passwd *pw;
         int r;
 
+        pw = getpwuid(uid);
+        if (!pw || !pw->pw_name)
+                return WORKER_SETUP_FAILED;
+        user = pw->pw_name;
         confdir = getenv("PLATFORMD_VERIFY_PAM_CONFDIR");
         if (confdir && *confdir)
                 r = pam_start_confdir("platformd-verify", user, &conversation, confdir, &pamh);
@@ -551,6 +590,12 @@ static int worker_run(uid_t uid, const char *user, const char *reason) {
         return WORKER_AUTH_FAILED;
 }
 
+static int on_monitor_installed(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        if (sd_bus_message_is_method_error(message, NULL))
+                verification_cancel(userdata);
+        return 0;
+}
+
 static int prepare_monitor(Verification *v) {
         int r;
 
@@ -561,7 +606,7 @@ static int prepare_monitor(Verification *v) {
                 return 0;
 #endif
 
-        r = sd_bus_match_signal(
+        r = sd_bus_match_signal_async(
                         g_bus,
                         &v->properties_slot,
                         "org.freedesktop.login1",
@@ -569,10 +614,11 @@ static int prepare_monitor(Verification *v) {
                         "org.freedesktop.DBus.Properties",
                         "PropertiesChanged",
                         on_session_properties,
+                        on_monitor_installed,
                         v);
         if (r < 0)
                 return r;
-        r = sd_bus_match_signal(
+        r = sd_bus_match_signal_async(
                         g_bus,
                         &v->removed_slot,
                         "org.freedesktop.login1",
@@ -580,10 +626,80 @@ static int prepare_monitor(Verification *v) {
                         "org.freedesktop.login1.Manager",
                         "SessionRemoved",
                         on_session_removed,
+                        on_monitor_installed,
                         v);
         if (r < 0)
                 return r;
         return session_eligible(v->session, v->uid, NULL) == 1 ? 0 : -EHOSTDOWN;
+}
+
+static int on_session_validated(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        Verification *v = userdata;
+        int locked;
+
+        v->validation_slot = sd_bus_slot_unref(v->validation_slot);
+        if (sd_bus_message_is_method_error(message, NULL) ||
+            sd_bus_message_enter_container(message, 'v', "b") <= 0 ||
+            sd_bus_message_read(message, "b", &locked) <= 0 || locked ||
+            sd_bus_message_exit_container(message) < 0 ||
+            sd_bus_message_at_end(message, true) <= 0 ||
+            session_eligible(v->session, v->uid, NULL) != 1 || verification_expired(v))
+                verification_cancel(v);
+        else if (v->worker_finished)
+                verification_complete(v);
+        else if (verification_launch(v) < 0)
+                verification_cancel(v);
+        return 0;
+}
+
+static int verification_validate(Verification *v) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *message = NULL;
+        int r;
+
+#ifdef VERIFYD_TESTING
+        const char *session = test_session_id();
+        if (session && streq(v->session, session)) {
+                if (v->worker_finished)
+                        verification_complete(v);
+                else
+                        return verification_launch(v);
+                return 0;
+        }
+#endif
+        if (!g_bus)
+                return -ENOTCONN;
+        if ((r = sd_bus_message_new_method_call(g_bus, &message, "org.freedesktop.login1", v->session_path,
+                                                "org.freedesktop.DBus.Properties", "Get")) < 0 ||
+            (r = sd_bus_message_append(message, "ss", "org.freedesktop.login1.Session", "LockedHint")) < 0)
+                return r;
+        return sd_bus_call_async(g_bus, &v->validation_slot, message, on_session_validated, v, 2U * 1000000U);
+}
+
+static int verification_launch(Verification *v) {
+        pid_t pid;
+        int r;
+
+        if (verification_expired(v))
+                return -ETIMEDOUT;
+        pid = verify_worker_fork();
+        if (pid < 0)
+                return pid;
+        if (pid == 0) {
+                char uid[32];
+
+                snprintf(uid, sizeof uid, "%u", (unsigned) v->uid);
+                execl("/proc/self/exe", "platformd-verifyd", "--pam-worker", uid, v->user, v->reason, NULL);
+                _exit(WORKER_SETUP_FAILED);
+        }
+        v->pid = pid;
+        r = sd_event_add_child(g_event, &v->worker, pid, WEXITED, on_verify_done, v);
+        if (r < 0) {
+                (void) kill(pid, SIGTERM);
+                while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+                        ;
+                v->pid = 0;
+        }
+        return r;
 }
 
 static int vl_verify_user(
@@ -595,16 +711,13 @@ static int vl_verify_user(
         _cleanup_free_ char *session = NULL, *session_object = NULL, *user = NULL;
         const char *requested, *reason;
         Verification *v = NULL;
-        struct passwd *pw;
         sd_json_variant *p;
         uid_t peer;
-        pid_t peer_pid, pid;
+        pid_t peer_pid;
         int r;
 
         if (sd_varlink_get_peer_uid(link, &peer) < 0 ||
-            sd_varlink_get_peer_pid(link, &peer_pid) < 0 ||
-            !(pw = getpwuid(peer)) ||
-            !(user = strdup(pw->pw_name)))
+            sd_varlink_get_peer_pid(link, &peer_pid) < 0)
                 return sd_varlink_error(link, "io.platformd.Verify.PermissionDenied", NULL);
 
         if (verification_for_uid(peer) || g_n_verifications >= VERIFY_MAX_INFLIGHT)
@@ -632,6 +745,15 @@ static int vl_verify_user(
         if (r < 0)
                 return sd_varlink_error(link, "io.platformd.Verify.NoSession", NULL);
 
+#ifdef VERIFYD_TESTING
+        if (test_session_id())
+                user = strdup("test-user");
+        else
+#endif
+                (void) sd_session_get_username(session, &user);
+        if (!user)
+                return sd_varlink_error(link, "io.platformd.Verify.NoSession", NULL);
+
         v = calloc(1, sizeof *v);
         if (!v)
                 return -ENOMEM;
@@ -643,8 +765,12 @@ static int vl_verify_user(
         session = NULL;
         v->session_path = session_object;
         session_object = NULL;
-
-        if (prepare_monitor(v) < 0) {
+        v->reason = strdup(reason);
+        v->result_status = WORKER_SETUP_FAILED;
+        if (!v->reason ||
+            sd_event_add_time_relative(g_event, &v->timeout, CLOCK_BOOTTIME, g_verify_timeout, 0,
+                                       on_verify_timeout, v) < 0 ||
+            sd_event_source_get_time(v->timeout, &v->deadline_usec) < 0 || prepare_monitor(v) < 0) {
                 verification_free(v);
                 return sd_varlink_error(link, "io.platformd.Verify.SessionNotEligible", NULL);
         }
@@ -657,51 +783,17 @@ static int vl_verify_user(
                         "PLATFORMD_VERIFY_REASON=%s", reason,
                         NULL);
 
-        pid = verify_worker_fork();
-        if (pid < 0) {
-                verification_free(v);
-                return sd_varlink_error(
-                                link,
-                                "io.platformd.Verify.VerificationUnsupported",
-                                NULL);
-        }
-        if (pid == 0) {
-                char uid[32];
-
-                /* Reinitialize library state after closing inherited descriptors. */
-                snprintf(uid, sizeof uid, "%u", (unsigned) peer);
-                execl("/proc/self/exe", "platformd-verifyd", "--pam-worker", uid, v->user, reason, NULL);
-                _exit(WORKER_SETUP_FAILED);
-        }
-        v->pid = pid;
-
-        if (sd_event_add_child(g_event, &v->worker, pid, WEXITED, on_verify_done, v) < 0 ||
-            sd_event_add_time_relative(
-                            g_event,
-                            &v->timeout,
-                            CLOCK_BOOTTIME,
-                            g_verify_timeout,
-                            0,
-                            on_verify_timeout,
-                            v) < 0) {
-                (void) kill(pid, SIGTERM);
-                while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
-                        ;
-                verification_free(v);
-                return sd_varlink_error(
-                                link,
-                                "io.platformd.Verify.VerificationUnsupported",
-                                NULL);
-        }
 
         v->next = g_verifications;
         g_verifications = v;
         g_n_verifications++;
+        if (verification_validate(v) < 0)
+                verification_cancel(v);
         return 0;
 }
 
 static int setup_varlink(sd_varlink_server *server, sd_event *event) {
-        _cleanup_free_ char *address = NULL;
+        _cleanup_free_ char *address = NULL, *lock_path = NULL;
         const char *directory;
         int r;
 
@@ -713,12 +805,21 @@ static int setup_varlink(sd_varlink_server *server, sd_event *event) {
         (void) mkdir(directory, 0755);
         if (asprintf(&address, "%s/io.platformd.Verify", directory) < 0)
                 return -ENOMEM;
+        if (asprintf(&lock_path, "%s/lock", directory) < 0)
+                return -ENOMEM;
+        g_listener_lock = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (g_listener_lock < 0 || flock(g_listener_lock, LOCK_EX | LOCK_NB) < 0)
+                return -errno;
 
         r = sd_varlink_server_bind_method(
                         server,
                         "io.platformd.Verify.VerifyUser",
                         vl_verify_user);
         if (r < 0)
+                return r;
+        if ((r = sd_varlink_server_add_interface(server, &vl_interface_io_platformd_Verify)) < 0 ||
+            (r = sd_varlink_server_set_info(server, "platformd", "platformd-verifyd", PROGRAM_VERSION,
+                                           "https://github.com/CoastLineSec/platformd-verifyd")) < 0)
                 return r;
         r = sd_varlink_server_bind_disconnect(server, on_disconnect);
         if (r < 0)
@@ -730,6 +831,27 @@ static int setup_varlink(sd_varlink_server *server, sd_event *event) {
         return sd_varlink_server_attach_event(server, event, 0);
 }
 
+static int on_dependency_lost(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        for (Verification *v = g_verifications, *next; v; v = next) {
+                next = v->next;
+                verification_cancel(v);
+        }
+        return sd_event_exit(g_event, EXIT_FAILURE);
+}
+
+static int on_logind_owner_changed(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        const char *name, *old_owner, *new_owner;
+
+        if (sd_bus_message_read(message, "sss", &name, &old_owner, &new_owner) <= 0 ||
+            !streq(name, "org.freedesktop.login1") || !*old_owner || streq(old_owner, new_owner))
+                return 0;
+        for (Verification *v = g_verifications, *next; v; v = next) {
+                next = v->next;
+                verification_cancel(v);
+        }
+        return 0;
+}
+
 int main(int argc, char *argv[]) {
         _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *server = NULL;
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
@@ -739,6 +861,20 @@ int main(int argc, char *argv[]) {
         sigset_t signals;
         int r;
 
+        if (argc == 2 && (streq(argv[1], "--help") || streq(argv[1], "-h"))) {
+                puts("platformd-verifyd [OPTIONS...]\n\nVerify user presence with PAM.\n\n"
+                     "  -h --help     Show this help\n"
+                     "     --version  Show package version");
+                return EXIT_SUCCESS;
+        }
+        if (argc == 2 && streq(argv[1], "--version")) {
+                puts("platformd-verifyd " PROGRAM_VERSION);
+                return EXIT_SUCCESS;
+        }
+        if (argc != 1 && !streq(argv[1], "--pam-worker")) {
+                fprintf(stderr, "Unexpected argument: %s\n", argv[1]);
+                return EXIT_FAILURE;
+        }
         timeout = getenv("PLATFORMD_VERIFY_TIMEOUT_SEC");
         if (timeout && *timeout) {
                 char *end = NULL;
@@ -746,8 +882,11 @@ int main(int argc, char *argv[]) {
 
                 errno = 0;
                 seconds = strtoul(timeout, &end, 10);
-                if (errno == 0 && end && *end == 0 && seconds > 0 && seconds <= 600)
-                        g_verify_timeout = seconds * 1000000U;
+                if (errno != 0 || timeout[0] < '0' || timeout[0] > '9' || *end || seconds == 0 || seconds > 600) {
+                        fprintf(stderr, "Invalid verification timeout: %s\n", timeout);
+                        return EXIT_FAILURE;
+                }
+                g_verify_timeout = seconds * 1000000U;
         }
 
         if (argc > 1 && streq(argv[1], "--pam-worker")) {
@@ -793,10 +932,20 @@ int main(int argc, char *argv[]) {
         r = sd_bus_open_system(&bus);
         if (r >= 0)
                 r = sd_bus_attach_event(bus, event, SD_EVENT_PRIORITY_NORMAL);
+        if (r >= 0)
+                r = sd_bus_match_signal(bus, NULL, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                         "org.freedesktop.DBus", "NameOwnerChanged", on_logind_owner_changed, NULL);
+        if (r >= 0)
+                r = sd_bus_match_signal(bus, NULL, NULL, "/org/freedesktop/DBus/Local",
+                                         "org.freedesktop.DBus.Local", "Disconnected", on_dependency_lost, NULL);
         if (r < 0) {
                 sd_journal_print(LOG_WARNING, "logind session validation is unavailable: %s",
                                  strerror(-r));
                 bus = sd_bus_flush_close_unref(bus);
+#ifdef VERIFYD_TESTING
+                if (!test_session_id())
+#endif
+                        return EXIT_FAILURE;
         }
         g_bus = bus;
 
@@ -826,12 +975,15 @@ int main(int argc, char *argv[]) {
         while (g_verifications) {
                 Verification *v = g_verifications;
 
-                while (waitpid(v->pid, NULL, 0) < 0 && errno == EINTR)
+                while (v->pid > 0 && waitpid(v->pid, NULL, 0) < 0 && errno == EINTR)
                         ;
                 verification_free(v);
         }
         while (g_submissions)
                 trust_submission_free(g_submissions);
         g_bus = NULL;
-        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        if (g_listener_lock >= 0)
+                close(g_listener_lock);
+        g_listener_lock = -1;
+        return r != 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }

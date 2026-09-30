@@ -126,17 +126,21 @@ static int ask_password(
         r = sd_varlink_set_input_sensitive(link);
         if (r < 0)
                 return r;
+        r = sd_varlink_set_relative_timeout(link, context->timeout_usec + 5U * 1000000U);
+        if (r < 0)
+                return r;
 
         r = sd_varlink_call(link, "io.systemd.AskPassword.Ask",
                             parameters, &reply, &error_id);
         if (reply)
                 sd_json_variant_sensitive(reply);
         if (r < 0) {
-                context->prompt_status = VERIFY_PROMPT_UNAVAILABLE;
+                context->prompt_status = r == -ETIMEDOUT ? VERIFY_PROMPT_TIMED_OUT : VERIFY_PROMPT_UNAVAILABLE;
                 return r;
         }
         if (error_id) {
-                if (streq(error_id, "io.systemd.AskPassword.TimeoutReached"))
+                if (streq(error_id, "io.systemd.AskPassword.TimeoutReached") ||
+                    streq(error_id, "io.systemd.TimedOut"))
                         context->prompt_status = VERIFY_PROMPT_TIMED_OUT;
                 else if (streq(error_id, "io.systemd.AskPassword.NoPasswordAvailable"))
                         context->prompt_status = VERIFY_PROMPT_UNAVAILABLE;

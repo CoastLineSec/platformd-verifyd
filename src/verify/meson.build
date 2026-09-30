@@ -30,6 +30,26 @@ verifyctl = executable(
 )
 
 # Tests.
+test_deadline = executable(
+        'test-deadline',
+        'test-deadline.c',
+        'verify-util.c',
+        'verify-worker.c',
+        dependencies : [libsystemd, libpam],
+        link_args : ['-Wl,--wrap=sd_varlink_reply', '-Wl,--wrap=sd_varlink_error', '-Wl,--wrap=sd_journal_send'],
+)
+test('deadline', find_program('sh'),
+     args : [meson.current_source_dir() / 'test-env.sh', test_deadline])
+
+test_logind = executable(
+        'test-logind',
+        'test-logind.c', 'verify-util.c', 'verify-worker.c',
+        dependencies : [libsystemd, libpam],
+        link_args : ['-Wl,--wrap=sd_varlink_reply', '-Wl,--wrap=sd_varlink_error', '-Wl,--wrap=sd_journal_send'],
+)
+test('logind', find_program('sh'),
+     args : [meson.current_source_dir() / 'test-logind.sh', test_logind])
+
 test_conversation = executable(
         'test-conversation',
         'test-conversation.c',

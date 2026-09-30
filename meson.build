@@ -10,7 +10,8 @@ project('platformd', 'c',
 
 # systemd builds with _GNU_SOURCE and does not treat unused function parameters
 # as errors (Varlink method handlers take a fixed signature).
-add_project_arguments('-D_GNU_SOURCE', '-Wno-unused-parameter', language : 'c')
+add_project_arguments('-D_GNU_SOURCE', '-Wno-unused-parameter',
+                      '-DPROGRAM_VERSION="@0@"'.format(meson.project_version()), language : 'c')
 
 libsystemd = dependency('libsystemd', version : '>= 258')
 
@@ -31,8 +32,13 @@ configure_file(
         install_dir : systemd_system_unit_dir,
 )
 
-# The PAM stack that names the presence factors, installed to the vendor PAM
-# directory (the administrator overrides it under /etc/pam.d/ if desired). PAM's
-# search path is fixed at /usr/lib/pam.d, so derive it from systemd's prefix.
-pam_vendor_dir = systemd.found() ? systemd.get_variable(pkgconfig : 'prefix') / 'lib/pam.d' : get_option('prefix') / 'lib/pam.d'
+pam_vendor_dir = get_option('pamvendordir')
+if pam_vendor_dir == ''
+        pam = dependency('pam', required : false)
+        pam_vendor_dir = pam.found() ? pam.get_variable(pkgconfig : 'vendordir', default_value : '') : ''
+        if pam_vendor_dir == ''
+                pam_vendor_dir = get_option('prefix') / 'lib/pam.d'
+        endif
+endif
 install_data('pam/platformd-verify', install_dir : pam_vendor_dir)
+install_data('src/verify/io.platformd.Verify.varlink', install_dir : get_option('datadir') / 'varlink')

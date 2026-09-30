@@ -2,10 +2,13 @@
 [Unit]
 Description=platformd user-presence verification service
 Documentation=man:platformd-verifyd.service(8)
+After=dbus.service systemd-logind.service
 
 [Service]
 Type=notify
 ExecStart=@LIBEXECDIR@/platformd-verifyd
+Restart=on-failure
+RestartSec=5s
 RuntimeDirectory=platformd-verifyd
 RuntimeDirectoryMode=0755
 LimitCORE=0

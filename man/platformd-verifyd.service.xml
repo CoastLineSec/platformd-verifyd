@@ -8,6 +8,7 @@
   <refentryinfo>
     <title>platformd-verifyd.service</title>
     <productname>platformd</productname>
+    <corpauthor>platformd contributors</corpauthor>
   </refentryinfo>
 
   <refmeta>
@@ -110,8 +111,10 @@
 
     <para>PAM password and PIN prompts are sent to the per-user
     <constant>io.systemd.AskPassword</constant> Varlink service. Prompt caching
-    is disabled. The target session must provide a compatible systemd password
-    agent for an interactive prompt to succeed. The prompt identifies
+    is disabled. A compatible systemd password presenter must be available for
+    an interactive prompt to succeed. The interface addresses a user, not an
+    individual session; session eligibility does not bind prompt presentation
+    to that session. A polkit agent does not implement this interface. The prompt identifies
     platformd-verifyd and labels the client-supplied request description. It
     does not assert an application identity or a trusted graphical origin.
     Replies are returned only to PAM. The Varlink input is marked sensitive
@@ -119,6 +122,11 @@
     release. PAM owns the responses delivered to its modules. Informational
     and error messages are written to the journal without authentication
     responses.</para>
+
+    <para>The verification deadline uses <constant>CLOCK_BOOTTIME</constant>
+    and is checked again before a successful result is returned. logind queries
+    are asynchronous and bounded to two seconds. Loss of the system bus stops
+    the service; the unit restarts it after five seconds.</para>
 
     <para>The reported method names the PAM service, not the individual PAM
     module that accepted the authentication.</para>

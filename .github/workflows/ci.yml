@@ -9,36 +9,73 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-latest
-    # Arch's libsystemd is current (>= 261); the sd-varlink / sd-json APIs the
-    # daemon uses require >= 257, which Ubuntu LTS runners do not ship.
     container: archlinux:latest
     strategy:
       fail-fast: false
       matrix:
-        sanitize: ['none', 'address,undefined']
-    name: build & test (sanitize=${{ matrix.sanitize }})
+        include:
+          - systemd: current
+            sanitize: none
+            libdir: lib
+          - systemd: current
+            sanitize: address,undefined
+            libdir: lib
+          - systemd: '258'
+            sanitize: none
+            libdir: lib64
+    name: build & test (systemd=${{ matrix.systemd }}, sanitize=${{ matrix.sanitize }})
     steps:
       - name: Install toolchain and dependencies
         run: |
           pacman -Sy --noconfirm --needed archlinux-keyring
           pacman -Syu --noconfirm --needed \
-            git base-devel meson ninja \
-            systemd pam \
+            git base-devel meson ninja gperf python-jinja \
+            systemd pam dbus \
             libxslt docbook-xsl
 
       - uses: actions/checkout@v4
 
+      - name: Build minimum libsystemd
+        if: matrix.systemd != 'current'
+        run: |
+          git clone --depth=1 --branch=v258 https://github.com/systemd/systemd.git "$RUNNER_TEMP/systemd"
+          test "$(git -C "$RUNNER_TEMP/systemd" rev-parse HEAD)" = 781d9d0789379d1ea1f2ecefb804d41e9c8b6c38
+          meson setup "$RUNNER_TEMP/systemd-build" "$RUNNER_TEMP/systemd" \
+            --prefix="$RUNNER_TEMP/systemd-install" --libdir=lib \
+            -Dmode=release -Dtests=false -Dman=disabled -Dhtml=disabled \
+            -Dtranslations=false -Dbootloader=disabled -Dc_std=gnu17 \
+            -Dc_args='-Wno-error=override-init -Wno-error=discarded-qualifiers'
+          ninja -C "$RUNNER_TEMP/systemd-build" libsystemd src/libsystemd/libsystemd.pc
+          meson install -C "$RUNNER_TEMP/systemd-build" --no-rebuild --tags=libsystemd
+          install -Dm644 "$RUNNER_TEMP/systemd-build/src/libsystemd/libsystemd.pc" \
+            "$RUNNER_TEMP/systemd-install/lib/pkgconfig/libsystemd.pc"
+          install -d "$RUNNER_TEMP/systemd-install/include/systemd"
+          install -m644 "$RUNNER_TEMP/systemd"/src/systemd/sd-*.h \
+            "$RUNNER_TEMP/systemd/src/systemd/_sd-common.h" "$RUNNER_TEMP/systemd-install/include/systemd/"
+          echo "PKG_CONFIG_PATH=$RUNNER_TEMP/systemd-install/lib/pkgconfig" >> "$GITHUB_ENV"
+
       - name: Configure
         run: |
-          extra=""
-          [ "${{ matrix.sanitize }}" != "none" ] && extra="-Db_sanitize=${{ matrix.sanitize }}"
-          meson setup build --prefix=/usr $extra
+          set -- --prefix=/usr --libdir=${{ matrix.libdir }} -Dwerror=true \
+            -Db_sanitize=${{ matrix.sanitize }} -Db_lundef=false
+          if [ "${{ matrix.systemd }}" != current ]; then
+            set -- "$@" -Dpamvendordir=/usr/lib64/pam.d
+          fi
+          meson setup build "$@"
 
       - name: Build
         run: ninja -C build
 
       - name: Test
         env:
-          ASAN_OPTIONS: detect_leaks=0
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: meson test -C build --print-errorlogs
+
+      - name: Check installation
+        run: |
+          meson install -C build --no-rebuild --destdir="$RUNNER_TEMP/stage"
+          test -f "$RUNNER_TEMP/stage/usr/share/varlink/io.platformd.Verify.varlink"
+          if [ "${{ matrix.systemd }}" != current ]; then
+            test -f "$RUNNER_TEMP/stage/usr/lib64/pam.d/platformd-verify"
+          fi

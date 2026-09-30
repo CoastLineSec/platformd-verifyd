@@ -37,6 +37,8 @@ static int cmd_verify(const char *reason) {
                 fprintf(stderr, "verifyctl: no verification service is running (%s)\n", addr);
                 return EXIT_FAILURE;
         }
+        if (sd_varlink_set_relative_timeout(link, 610U * 1000000U) < 0)
+                return EXIT_FAILURE;
         (void) sd_pid_get_session(0, &session);   /* the current session, if any */
 
         if (sd_json_buildo(&params,
