@@ -5,11 +5,20 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-test:
     runs-on: ubuntu-latest
     container: archlinux:latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -27,11 +36,18 @@ jobs:
     steps:
       - name: Install toolchain and dependencies
         run: |
-          pacman -Sy --noconfirm --needed archlinux-keyring
-          pacman -Syu --noconfirm --needed \
+          retry() {
+            for attempt in 1 2 3; do
+              if "$@"; then return 0; fi
+              if [ "$attempt" -eq 3 ]; then return 1; fi
+              sleep "$((attempt * 5))"
+            done
+          }
+          retry pacman -Sy --noconfirm --needed archlinux-keyring
+          retry pacman -Syu --noconfirm --needed \
             git base-devel meson ninja gperf python-jinja \
             systemd pam dbus \
-            libxslt docbook-xsl
+            libxslt libxml2 docbook-xsl groff shellcheck actionlint
 
       - uses: actions/checkout@v4
 
@@ -40,7 +56,7 @@ jobs:
         run: |
           git clone --depth=1 --branch=v258 https://github.com/systemd/systemd.git "$RUNNER_TEMP/systemd"
           test "$(git -C "$RUNNER_TEMP/systemd" rev-parse HEAD)" = 781d9d0789379d1ea1f2ecefb804d41e9c8b6c38
-          meson setup "$RUNNER_TEMP/systemd-build" "$RUNNER_TEMP/systemd" \
+          env -i PATH=/usr/bin:/bin CC=cc meson setup "$RUNNER_TEMP/systemd-build" "$RUNNER_TEMP/systemd" \
             --prefix="$RUNNER_TEMP/systemd-install" --libdir=lib \
             -Dmode=release -Dtests=false -Dman=disabled -Dhtml=disabled \
             -Dtranslations=false -Dbootloader=disabled -Dc_std=gnu17 \
@@ -54,28 +70,23 @@ jobs:
             "$RUNNER_TEMP/systemd/src/systemd/_sd-common.h" "$RUNNER_TEMP/systemd-install/include/systemd/"
           echo "PKG_CONFIG_PATH=$RUNNER_TEMP/systemd-install/lib/pkgconfig" >> "$GITHUB_ENV"
 
-      - name: Configure
+      - name: Check source, build, tests, and installation
         run: |
-          set -- --prefix=/usr --libdir=${{ matrix.libdir }} -Dwerror=true \
+          set -- --libdir=${{ matrix.libdir }} \
             -Db_sanitize=${{ matrix.sanitize }} -Db_lundef=false
           if [ "${{ matrix.systemd }}" != current ]; then
             set -- "$@" -Dpamvendordir=/usr/lib64/pam.d
           fi
-          meson setup build "$@"
-
-      - name: Build
-        run: ninja -C build
-
-      - name: Test
-        env:
-          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
-          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: meson test -C build --print-errorlogs
-
-      - name: Check installation
-        run: |
-          meson install -C build --no-rebuild --destdir="$RUNNER_TEMP/stage"
-          test -f "$RUNNER_TEMP/stage/usr/share/varlink/io.platformd.Verify.varlink"
+          bash .github/scripts/check.sh "$RUNNER_TEMP/check" "$@"
           if [ "${{ matrix.systemd }}" != current ]; then
-            test -f "$RUNNER_TEMP/stage/usr/lib64/pam.d/platformd-verify"
+            test -f "$RUNNER_TEMP/check/stage/usr/lib64/pam.d/platformd-verify"
           fi
+
+      - name: Preserve failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-systemd-${{ matrix.systemd }}-sanitize-${{ matrix.sanitize }}
+          path: ${{ runner.temp }}/check/build/meson-logs/
+          if-no-files-found: ignore
+          retention-days: 7
