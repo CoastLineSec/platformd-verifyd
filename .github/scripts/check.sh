@@ -47,8 +47,11 @@ test -f "$check_dir/stage/usr/share/man/man8/platformd-verifyd.service.8"
 )
 
 unit=platformd-verifyd.service
-sed "s|^ExecStart=.*|ExecStart=$check_dir/stage/usr/libexec/platformd-verifyd|" \
-        "$check_dir/build/$unit" > "$check_dir/units/$unit"
+unit_file="$check_dir/stage/usr/lib/systemd/system/$unit"
+test -f "$unit_file"
+[[ $(grep '^ExecStart=' "$unit_file") == 'ExecStart=/usr/libexec/platformd-verifyd' ]]
+sed "s|^ExecStart=/usr/libexec/platformd-verifyd$|ExecStart=$check_dir/stage/usr/libexec/platformd-verifyd|" \
+        "$unit_file" > "$check_dir/units/$unit"
 env -i PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$check_dir/runtime" \
         SYSTEMD_UNIT_PATH="$check_dir/units:/usr/lib/systemd/system" \
         systemd-analyze --man=no --generators=no verify "$check_dir/units/$unit"
