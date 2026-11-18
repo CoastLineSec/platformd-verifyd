@@ -26,13 +26,20 @@ jobs:
           - systemd: current
             sanitize: none
             libdir: lib
+            profile: standard
           - systemd: current
             sanitize: address,undefined
             libdir: lib
+            profile: standard
           - systemd: '258'
             sanitize: none
             libdir: lib64
-    name: build & test (systemd=${{ matrix.systemd }}, sanitize=${{ matrix.sanitize }})
+            profile: standard
+          - systemd: current
+            sanitize: none
+            libdir: lib
+            profile: hardened
+    name: build & test (systemd=${{ matrix.systemd }}, sanitize=${{ matrix.sanitize }}, profile=${{ matrix.profile }})
     steps:
       - name: Install toolchain and dependencies
         run: |
@@ -74,6 +81,11 @@ jobs:
         run: |
           set -- --libdir=${{ matrix.libdir }} \
             -Db_sanitize=${{ matrix.sanitize }} -Db_lundef=false
+          if [ "${{ matrix.profile }}" = hardened ]; then
+            set -- "$@" -Doptimization=2 \
+              -Dc_args='-D_FORTIFY_SOURCE=3 -fstack-clash-protection -fstack-protector-strong -fno-plt' \
+              -Dc_link_args='-Wl,-z,relro,-z,now'
+          fi
           if [ "${{ matrix.systemd }}" != current ]; then
             set -- "$@" -Dpamvendordir=/usr/lib64/pam.d
           fi
@@ -86,7 +98,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-systemd-${{ matrix.systemd }}-sanitize-${{ matrix.sanitize }}
+          name: logs-systemd-${{ matrix.systemd }}-sanitize-${{ matrix.sanitize }}-profile-${{ matrix.profile }}
           path: ${{ runner.temp }}/check/build/meson-logs/
           if-no-files-found: ignore
           retention-days: 7
