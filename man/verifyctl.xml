@@ -52,7 +52,13 @@
         <term><command>verify</command> <optional><replaceable>REASON</replaceable></optional></term>
         <listitem><para>Verify that the current user is present, optionally with a
         human-readable <replaceable>REASON</replaceable>. Prints whether the user
-        was verified and the PAM service that ran.</para></listitem>
+        was verified and the PAM service that ran. PAM informational and error
+        messages are printed to standard error while verification is running.
+        No authentication responses are read or displayed by this command.
+        On services without <function>VerifyUserWithMessages</function>, the
+        command uses <function>VerifyUser</function> without message delivery.
+        Only <constant>MethodNotFound</constant> before any message permits this
+        fallback; a started verification is never retried.</para></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>

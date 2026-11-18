@@ -52,6 +52,7 @@ done
 [ -S "$PLATFORMD_VERIFY_SOCKET" ]
 
 if ! timeout 10 "$client" verify "worker executable test" >"$TMPDIR/client.log" 2>&1 ||
+   ! grep -q 'PAM info: worker-exec-conversation' "$TMPDIR/client.log" ||
    ! grep -q 'verified: yes' "$TMPDIR/client.log"; then
     cat "$TMPDIR/client.log" "$TMPDIR/daemon.log" >&2
     exit 1

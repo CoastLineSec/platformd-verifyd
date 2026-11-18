@@ -2,6 +2,7 @@
 /* verifyctl requests presence verification from platformd-verifyd. */
 
 #include <stdbool.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,14 +16,110 @@
 static inline void freep(void *p) { free(*(void **) p); }
 #define _cleanup_free_ _cleanup_(freep)
 
+typedef struct VerificationReply {
+        sd_json_variant *result;
+        char *error;
+        unsigned messages;
+        int status;
+        bool done;
+} VerificationReply;
+
+static int on_reply(sd_varlink *link, sd_json_variant *parameters, const char *error,
+                    sd_varlink_reply_flags_t flags, void *userdata) {
+        VerificationReply *reply = userdata;
+        sd_json_variant *message, *result, *style, *text;
+        const char *s;
+        int r = -EPROTO;
+
+        if (error) {
+                if (flags & SD_VARLINK_REPLY_CONTINUES)
+                        goto fail;
+                reply->error = strdup(error);
+                if (!reply->error) {
+                        r = -ENOMEM;
+                        goto fail;
+                }
+                reply->done = true;
+                return 0;
+        }
+        message = sd_json_variant_by_key(parameters, "message");
+        result = sd_json_variant_by_key(parameters, "result");
+        if (flags & SD_VARLINK_REPLY_CONTINUES) {
+                if (!sd_json_variant_is_object(message) || (result && !sd_json_variant_is_null(result)) ||
+                    ++reply->messages > 32)
+                        goto fail;
+                style = sd_json_variant_by_key(message, "style");
+                text = sd_json_variant_by_key(message, "text");
+                if (!sd_json_variant_is_string(style) || !sd_json_variant_is_string(text) ||
+                    (!streq(sd_json_variant_string(style), "info") &&
+                     !streq(sd_json_variant_string(style), "error")))
+                        goto fail;
+                s = sd_json_variant_string(text);
+                if (strlen(s) > 1024)
+                        goto fail;
+                for (const unsigned char *p = (const unsigned char *) s; *p; p++)
+                        if (*p < 0x20 || *p == 0x7f)
+                                goto fail;
+                fprintf(stderr, "PAM %s: %s\n", sd_json_variant_string(style), s);
+        } else {
+                if (!sd_json_variant_is_object(result) || (message && !sd_json_variant_is_null(message)))
+                        goto fail;
+                reply->result = sd_json_variant_ref(result);
+                reply->done = true;
+        }
+        return 0;
+fail:
+        reply->status = r;
+        reply->done = true;
+        return 0;
+}
+
+static int verify_with_messages(sd_varlink *link, sd_json_variant *params,
+                                sd_json_variant **ret, char **ret_error) {
+        VerificationReply reply = {};
+        int r;
+
+        sd_varlink_set_userdata(link, &reply);
+        r = sd_varlink_bind_reply(link, on_reply);
+        if (r >= 0)
+                r = sd_varlink_observe(link, "io.platformd.Verify.VerifyUserWithMessages", params);
+        while (r >= 0 && !reply.done) {
+                r = sd_varlink_process(link);
+                if (r == 0 && !reply.done)
+                        r = sd_varlink_wait(link, UINT64_MAX);
+        }
+        if (r >= 0 && reply.status < 0)
+                r = reply.status;
+        sd_varlink_set_userdata(link, NULL);
+        (void) sd_varlink_bind_reply(link, NULL);
+        if (r >= 0 && reply.error && reply.messages == 0 &&
+            streq(reply.error, "org.varlink.service.MethodNotFound")) {
+                const char *error = NULL;
+                sd_json_variant *result = NULL;
+
+                free(reply.error);
+                reply.error = NULL;
+                r = sd_varlink_call(link, "io.platformd.Verify.VerifyUser", params, &result, &error);
+                if (r >= 0) {
+                        reply.result = sd_json_variant_ref(result);
+                        if (error && !(reply.error = strdup(error)))
+                                r = -ENOMEM;
+                }
+        }
+        *ret = reply.result;
+        *ret_error = reply.error;
+        return r;
+}
+
 static int cmd_verify(const char *reason) {
         _cleanup_(sd_varlink_unrefp) sd_varlink *link = NULL;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *params = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
         _cleanup_free_ char *addr = NULL, *session = NULL;
+        _cleanup_free_ char *err = NULL;
         const char *sock = getenv("PLATFORMD_VERIFY_SOCKET");
         const char *dir = getenv("PLATFORMD_VERIFYD_RUNTIME");
-        const char *err = NULL;
-        sd_json_variant *reply = NULL, *v;
+        sd_json_variant *v;
         bool verified;
         int r;
 
@@ -47,7 +144,8 @@ static int cmd_verify(const char *reason) {
                 return EXIT_FAILURE;
 
         printf("Verify user presence with the configured factor.\n");
-        r = sd_varlink_call(link, "io.platformd.Verify.VerifyUser", params, &reply, &err);
+        fflush(stdout);
+        r = verify_with_messages(link, params, &reply, &err);
         if (r < 0) {
                 fprintf(stderr, "verifyctl: call failed: %s\n", strerror(-r));
                 return EXIT_FAILURE;
@@ -58,7 +156,11 @@ static int cmd_verify(const char *reason) {
         }
 
         v = sd_json_variant_by_key(reply, "verified");
-        verified = v && sd_json_variant_boolean(v);
+        if (!sd_json_variant_is_boolean(v)) {
+                fprintf(stderr, "verifyctl: invalid verification result\n");
+                return EXIT_FAILURE;
+        }
+        verified = sd_json_variant_boolean(v);
         v = sd_json_variant_by_key(reply, "method");
         printf("verified: %s   method: %s\n", verified ? "yes" : "no",
                v && sd_json_variant_is_string(v) ? sd_json_variant_string(v) : "-");

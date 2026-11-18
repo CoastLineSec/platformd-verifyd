@@ -4,9 +4,11 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <systemd/sd-journal.h>
@@ -19,6 +21,66 @@ static inline void freep(void *p) { free(*(void **) p); }
 #define _cleanup_free_ _cleanup_(freep)
 
 #define VERIFY_RESPONSE_MAX (64U * 1024U)
+
+int verify_message_send(VerifyMessageState *state, int style, const char *text) {
+        VerifyMessage message;
+        size_t size;
+        ssize_t n;
+        int r;
+
+        if (state->failed)
+                return -EIO;
+        if ((style != PAM_TEXT_INFO && style != PAM_ERROR_MSG) ||
+            !verify_text_valid(text, VERIFY_PAM_MESSAGE_MAX)) {
+                r = -EINVAL;
+                goto fail;
+        }
+        if (state->count >= VERIFY_MESSAGES_MAX) {
+                r = -E2BIG;
+                goto fail;
+        }
+        message.style = (uint8_t) style;
+        size = strlen(text) + 1;
+        memcpy(message.text, text, size);
+        size += sizeof message.style;
+        do
+                n = send(state->fd, &message, size, MSG_DONTWAIT | MSG_NOSIGNAL);
+        while (n < 0 && errno == EINTR);
+        if (n < 0 || (size_t) n != size) {
+                r = n < 0 ? -errno : -EIO;
+                goto fail;
+        }
+        state->count++;
+        return 0;
+fail:
+        state->failed = true;
+        return r;
+}
+
+int verify_message_receive(int fd, VerifyMessage *ret) {
+        struct iovec iov = { .iov_base = ret, .iov_len = sizeof *ret };
+        struct msghdr message = { .msg_iov = &iov, .msg_iovlen = 1 };
+        ssize_t n;
+
+        do
+                n = recvmsg(fd, &message, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+        while (n < 0 && errno == EINTR);
+        if (n < 0)
+                return -errno;
+        if (n == 0) {
+                struct pollfd pfd = { .fd = fd, .events = POLLRDHUP };
+
+                /* Empty records followed by shutdown are indistinguishable from EOF.
+                 * The sender always includes a style byte and a string terminator. */
+                return poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLRDHUP | POLLHUP)) ? 0 : -EBADMSG;
+        }
+        if (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC) || n < 2 ||
+            (ret->style != PAM_TEXT_INFO && ret->style != PAM_ERROR_MSG) ||
+            ret->text[n - 2] != 0 || strlen(ret->text) != (size_t) n - 2 ||
+            !verify_text_valid(ret->text, VERIFY_PAM_MESSAGE_MAX))
+                return -EBADMSG;
+        return 1;
+}
 
 bool verify_text_valid(const char *text, size_t max) {
         size_t n;
@@ -214,12 +276,19 @@ int verify_pam_conversation(
                 case PAM_TEXT_INFO:
                 case PAM_ERROR_MSG:
                         if (!verify_text_valid(text, VERIFY_PAM_MESSAGE_MAX)) {
+                                if (context->messages)
+                                        context->messages->failed = true;
                                 context->prompt_status = VERIFY_PROMPT_PROTOCOL_ERROR;
                                 r = PAM_CONV_ERR;
                                 goto fail;
                         }
                         sd_journal_print(messages[i]->msg_style == PAM_ERROR_MSG ? LOG_NOTICE : LOG_INFO,
                                          "pam: %s", text);
+                        if (context->messages &&
+                            verify_message_send(context->messages, messages[i]->msg_style, text) < 0) {
+                                r = PAM_CONV_ERR;
+                                goto fail;
+                        }
                         break;
                 default:
                         context->prompt_status = VERIFY_PROMPT_PROTOCOL_ERROR;

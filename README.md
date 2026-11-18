@@ -32,9 +32,11 @@ The installed PAM service is `platformd-verify`. The default stack uses
 `-Dpamvendordir=PATH` selects the vendor PAM directory. The default is taken
 from `pam.pc`, with `${prefix}/lib/pam.d` as the fallback.
 
-The password interface is per-user, not per-session. PAM informational messages
-are recorded in the journal. A polkit authentication agent does not implement
-this password interface.
+The password interface is per-user, not per-session. PAM informational and error
+messages are displayed by `verifyctl` and recorded in the journal. A polkit
+authentication agent does not implement this password interface. Other clients
+must opt in to `VerifyUserWithMessages` to receive these messages; existing
+`VerifyUser` clients receive only the final outcome.
 
 See `platformd-verifyd.service(8)` and `verifyctl(1)` for details.
 

@@ -12,6 +12,25 @@ static SD_VARLINK_DEFINE_METHOD(VerifyUser,
 
 static SD_VARLINK_DEFINE_ERROR(PermissionDenied);
 
+static SD_VARLINK_DEFINE_ENUM_TYPE(MessageStyle,
+        SD_VARLINK_DEFINE_ENUM_VALUE(info),
+        SD_VARLINK_DEFINE_ENUM_VALUE(error));
+
+static SD_VARLINK_DEFINE_STRUCT_TYPE(VerificationMessage,
+        SD_VARLINK_DEFINE_FIELD_BY_TYPE(style, MessageStyle, 0),
+        SD_VARLINK_DEFINE_FIELD(text, SD_VARLINK_STRING, 0));
+
+static SD_VARLINK_DEFINE_STRUCT_TYPE(VerificationResult,
+        SD_VARLINK_DEFINE_FIELD(verified, SD_VARLINK_BOOL, 0),
+        SD_VARLINK_DEFINE_FIELD(method, SD_VARLINK_STRING, 0),
+        SD_VARLINK_DEFINE_FIELD(realtimeUSec, SD_VARLINK_INT, 0));
+
+static SD_VARLINK_DEFINE_METHOD_FULL(VerifyUserWithMessages, SD_VARLINK_REQUIRES_MORE,
+        SD_VARLINK_DEFINE_INPUT(sessionId, SD_VARLINK_STRING, 0),
+        SD_VARLINK_DEFINE_INPUT(reason, SD_VARLINK_STRING, 0),
+        SD_VARLINK_DEFINE_OUTPUT_BY_TYPE(message, VerificationMessage, SD_VARLINK_NULLABLE),
+        SD_VARLINK_DEFINE_OUTPUT_BY_TYPE(result, VerificationResult, SD_VARLINK_NULLABLE));
+
 static SD_VARLINK_DEFINE_ERROR(VerificationUnsupported);
 
 static SD_VARLINK_DEFINE_ERROR(VerificationTimedOut);
@@ -30,6 +49,10 @@ static SD_VARLINK_DEFINE_ERROR(Busy);
 
 static SD_VARLINK_DEFINE_INTERFACE(io_platformd_Verify, "io.platformd.Verify",
         &vl_method_VerifyUser,
+        &vl_type_MessageStyle,
+        &vl_type_VerificationMessage,
+        &vl_type_VerificationResult,
+        &vl_method_VerifyUserWithMessages,
         &vl_error_PermissionDenied,
         &vl_error_VerificationUnsupported,
         &vl_error_VerificationTimedOut,

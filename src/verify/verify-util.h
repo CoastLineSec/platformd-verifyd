@@ -10,6 +10,18 @@
 #define VERIFY_REASON_MAX 256
 #define VERIFY_SESSION_MAX 256
 #define VERIFY_PAM_MESSAGE_MAX 1024
+#define VERIFY_MESSAGES_MAX 32
+
+typedef struct VerifyMessage {
+        uint8_t style;
+        char text[VERIFY_PAM_MESSAGE_MAX + 1];
+} VerifyMessage;
+
+typedef struct VerifyMessageState {
+        int fd;
+        unsigned count;
+        bool failed;
+} VerifyMessageState;
 
 typedef enum VerifyPromptStatus {
         VERIFY_PROMPT_NONE,
@@ -26,8 +38,11 @@ typedef struct VerifyConversationContext {
         uint64_t timeout_usec;
         unsigned sequence;
         VerifyPromptStatus prompt_status;
+        VerifyMessageState *messages;
 } VerifyConversationContext;
 
+int verify_message_send(VerifyMessageState *state, int style, const char *text);
+int verify_message_receive(int fd, VerifyMessage *ret);
 bool verify_text_valid(const char *text, size_t max);
 bool verify_session_class_allowed(const char *class);
 void verify_erase_string(char *s);

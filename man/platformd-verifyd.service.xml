@@ -62,12 +62,28 @@
     <citerefentry><refentrytitle>varlink</refentrytitle><manvolnum>7</manvolnum></citerefentry>
     interface, <constant>io.platformd.Verify</constant>, on a
     <constant>AF_UNIX</constant> socket at
-    <filename>/run/platformd-verifyd/io.platformd.Verify</filename>. Its one method,
+    <filename>/run/platformd-verifyd/io.platformd.Verify</filename>. The method
     <function>VerifyUser</function>, takes the session to refresh and a
     human-readable reason, runs the PAM stack, and returns whether the user was
     verified together with the PAM service that ran. The reason is descriptive
     text supplied by the client. It is not a verified application identity.
     Authentication responses do not cross this interface.</para>
+
+    <para><function>VerifyUserWithMessages</function> has the same authentication
+    semantics and requires the Varlink <constant>more</constant> flag.
+    Intermediate replies contain a <varname>message</varname> with
+    <varname>style</varname> (<constant>info</constant> or <constant>error</constant>)
+    and <varname>text</varname>. The terminal reply contains only
+    <varname>result</varname>, with the fields returned by
+    <function>VerifyUser</function>, or an error. Only PAM informational and error
+    messages are forwarded. No input prompts or authentication responses are
+    forwarded, and no message response is accepted. Delivery is bounded to
+    32 messages of 1024 bytes each. Invalid records, overflow, or delivery failure
+    cancel verification. Slow clients do not block the worker or the service.
+    Messages contain PAM module text and do not establish a trusted UI.
+    <function>VerifyUser</function> remains outcome-only. Message delivery is
+    opt-in for each client; it does not add presentation to existing callers
+    or unrelated desktop agents.</para>
 
     <para>The PAM conversation runs in a supervised worker, so a factor that waits at
     the reader does not block the service. One verification runs for each user at
@@ -80,7 +96,8 @@
 
     <para>The supervisor uses the procfs children interface to collect orphaned
     descendants. It does not run PAM and closes inherited descriptors other
-    than standard input, output, and error.
+    than standard input, output, and error. A dedicated nonblocking message
+    descriptor is passed only to the PAM worker and closed on subsequent exec.
     The PAM worker re-executes the service binary before loading the stack, so
     libraries do not retain stale descriptor state from the daemon.
     Service-wide termination uses the systemd control group. Worker supervision
@@ -106,7 +123,8 @@
     <filename>pam_fprintd.so</filename>. Administrators may configure other PAM
     authentication modules. PAM control flags determine the final authentication
     result. A successful stack result is not overridden by an earlier
-    conversation failure. Request cancellation and the service deadline remain
+    password conversation failure. Message-delivery failure, request cancellation,
+    and the service deadline remain
     independent of that result.</para>
 
     <para>PAM password and PIN prompts are sent to the per-user

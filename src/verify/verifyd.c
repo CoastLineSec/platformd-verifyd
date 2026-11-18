@@ -6,6 +6,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -16,6 +17,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 
 #include <security/pam_appl.h>
@@ -42,6 +44,7 @@ enum {
         WORKER_PROMPT_UNAVAILABLE = 10,
         WORKER_PROMPT_TIMED_OUT = 11,
         WORKER_PROMPT_CANCELLED = 12,
+        WORKER_MESSAGE_FAILED = 13,
 };
 
 typedef struct Verification Verification;
@@ -52,6 +55,7 @@ struct Verification {
         sd_varlink *link;
         sd_event_source *worker;
         sd_event_source *timeout;
+        sd_event_source *message_source;
         sd_bus_slot *properties_slot;
         sd_bus_slot *removed_slot;
         sd_bus_slot *validation_slot;
@@ -66,6 +70,9 @@ struct Verification {
         pid_t pid;
         uint64_t deadline_usec;
         int result_status;
+        int message_fd;
+        unsigned n_messages;
+        bool messages;
         bool worker_finished;
         bool client_gone;
         bool timed_out;
@@ -261,6 +268,9 @@ static void verification_free(Verification *v) {
 
         sd_event_source_disable_unref(v->worker);
         sd_event_source_disable_unref(v->timeout);
+        sd_event_source_disable_unref(v->message_source);
+        if (v->messages && v->message_fd >= 0)
+                close(v->message_fd);
         sd_bus_slot_unref(v->properties_slot);
         sd_bus_slot_unref(v->removed_slot);
         sd_bus_slot_unref(v->validation_slot);
@@ -437,6 +447,7 @@ static void submit_to_trustd(const char *user, uid_t uid, const char *session) {
 
 static void verification_complete(Verification *v) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *result = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
         bool verified;
         const char *outcome;
         int status = v->result_status;
@@ -499,8 +510,10 @@ static void verification_complete(Verification *v) {
                                                         SD_JSON_BUILD_STRING("platformd-verify")),
                                         SD_JSON_BUILD_PAIR(
                                                         "realtimeUSec",
-                                                        SD_JSON_BUILD_UNSIGNED(now_real()))) >= 0)
-                        (void) sd_varlink_reply(v->link, result);
+                                                        SD_JSON_BUILD_UNSIGNED(now_real()))) >= 0 &&
+                         (!v->messages || sd_json_buildo(&reply,
+                                        SD_JSON_BUILD_PAIR("result", SD_JSON_BUILD_VARIANT(result))) >= 0))
+                        (void) sd_varlink_reply(v->link, v->messages ? reply : result);
                 else
                         (void) sd_varlink_error(
                                         v->link,
@@ -513,6 +526,47 @@ static void verification_complete(Verification *v) {
         verification_free(v);
 }
 
+static int verification_read_messages(Verification *v) {
+        int r;
+
+        if (!v->messages || v->message_fd < 0)
+                return 0;
+        for (;;) {
+                VerifyMessage message;
+
+                r = verify_message_receive(v->message_fd, &message);
+                if (r == -EAGAIN || r == -EWOULDBLOCK)
+                        return 0;
+                if (r <= 0) {
+                        v->message_source = sd_event_source_disable_unref(v->message_source);
+                        close(v->message_fd);
+                        v->message_fd = -1;
+                        return r;
+                }
+                if (++v->n_messages > VERIFY_MESSAGES_MAX)
+                        return -E2BIG;
+                if (v->cancelled || v->client_gone || v->timed_out || verification_expired(v))
+                        continue;
+                r = sd_varlink_notifybo(v->link,
+                                SD_JSON_BUILD_PAIR("message", SD_JSON_BUILD_OBJECT(
+                                        SD_JSON_BUILD_PAIR("style", SD_JSON_BUILD_STRING(
+                                                        message.style == PAM_ERROR_MSG ? "error" : "info")),
+                                        SD_JSON_BUILD_PAIR("text", SD_JSON_BUILD_STRING(message.text)))));
+                if (r < 0)
+                        return r;
+        }
+}
+
+static int on_worker_message(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
+        Verification *v = userdata;
+
+        if (verification_read_messages(v) < 0) {
+                v->message_source = sd_event_source_disable_unref(v->message_source);
+                verification_cancel(v);
+        }
+        return 0;
+}
+
 static int on_verify_done(sd_event_source *source, const siginfo_t *si, void *userdata) {
         Verification *v = userdata;
 
@@ -520,6 +574,9 @@ static int on_verify_done(sd_event_source *source, const siginfo_t *si, void *us
         v->pid = 0;
         v->worker_finished = true;
         v->result_status = si->si_code == CLD_EXITED ? si->si_status : WORKER_AUTH_FAILED;
+        /* Child exit may be dispatched before the final queued message. */
+        if (verification_read_messages(v) < 0 || v->result_status == WORKER_MESSAGE_FAILED)
+                v->cancelled = true;
         v->timed_out |= verification_expired(v);
         if (v->timed_out || v->cancelled || v->client_gone || v->result_status != EXIT_SUCCESS)
                 verification_complete(v);
@@ -552,12 +609,14 @@ static void on_disconnect(sd_varlink_server *server, sd_varlink *link, void *use
                 }
 }
 
-static int worker_run(uid_t uid, const char *user, const char *reason) {
+static int worker_run(uid_t uid, const char *user, const char *reason, int message_fd) {
+        VerifyMessageState messages = { .fd = message_fd };
         VerifyConversationContext context = {
                 .address = getenv("PLATFORMD_ASK_PASSWORD_SOCKET"),
                 .reason = reason,
                 .uid = uid,
                 .timeout_usec = g_verify_timeout,
+                .messages = message_fd >= 0 ? &messages : NULL,
         };
         struct pam_conv conversation = { verify_pam_conversation, &context };
         const char *confdir;
@@ -579,6 +638,8 @@ static int worker_run(uid_t uid, const char *user, const char *reason) {
 
         r = pam_authenticate(pamh, 0);
         (void) pam_end(pamh, r);
+        if (messages.failed)
+                return WORKER_MESSAGE_FAILED;
         if (r == PAM_SUCCESS)
                 return EXIT_SUCCESS;
         if (context.prompt_status == VERIFY_PROMPT_TIMED_OUT)
@@ -780,20 +841,40 @@ static int verification_select_next(Verification *v) {
 
 static int verification_launch(Verification *v) {
         pid_t pid;
+        int pair[2] = { -1, -1 };
         int r;
 
         if (verification_expired(v))
                 return -ETIMEDOUT;
-        pid = verify_worker_fork();
-        if (pid < 0)
+        if (v->messages) {
+                if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pair) < 0)
+                        return -errno;
+                v->message_fd = pair[0];
+                if (shutdown(pair[0], SHUT_WR) < 0 || shutdown(pair[1], SHUT_RD) < 0 ||
+                    (r = sd_event_add_io(g_event, &v->message_source, pair[0], EPOLLIN,
+                                         on_worker_message, v)) < 0) {
+                        close(pair[1]);
+                        return -EIO;
+                }
+        }
+        pid = verify_worker_fork(pair[1]);
+        if (pid < 0) {
+                if (pair[1] >= 0)
+                        close(pair[1]);
                 return pid;
+        }
         if (pid == 0) {
-                char uid[32];
+                char uid[32], fd[32];
 
                 snprintf(uid, sizeof uid, "%u", (unsigned) v->uid);
-                execl("/proc/self/exe", "platformd-verifyd", "--pam-worker", uid, v->user, v->reason, NULL);
+                snprintf(fd, sizeof fd, "%d", pair[1]);
+                if (pair[1] >= 0 && fcntl(pair[1], F_SETFD, 0) < 0)
+                        _exit(WORKER_SETUP_FAILED);
+                execl("/proc/self/exe", "platformd-verifyd", "--pam-worker", uid, v->user, v->reason, fd, NULL);
                 _exit(WORKER_SETUP_FAILED);
         }
+        if (pair[1] >= 0)
+                close(pair[1]);
         v->pid = pid;
         r = sd_event_add_child(g_event, &v->worker, pid, WEXITED, on_verify_done, v);
         if (r < 0) {
@@ -805,11 +886,10 @@ static int verification_launch(Verification *v) {
         return r;
 }
 
-static int vl_verify_user(
+static int verify_user(
                 sd_varlink *link,
                 sd_json_variant *parameters,
-                sd_varlink_method_flags_t flags,
-                void *userdata) {
+                bool messages) {
 
         _cleanup_free_ char *session = NULL, *session_object = NULL;
         char **candidates = NULL;
@@ -851,6 +931,8 @@ static int vl_verify_user(
                 return -ENOMEM;
         }
         v->link = sd_varlink_ref(link);
+        v->messages = messages;
+        v->message_fd = -1;
         v->uid = peer;
         v->session = session;
         session = NULL;
@@ -877,6 +959,18 @@ static int vl_verify_user(
         return 0;
 }
 
+static int vl_verify_user(sd_varlink *link, sd_json_variant *parameters,
+                          sd_varlink_method_flags_t flags, void *userdata) {
+        return verify_user(link, parameters, false);
+}
+
+static int vl_verify_user_with_messages(sd_varlink *link, sd_json_variant *parameters,
+                                        sd_varlink_method_flags_t flags, void *userdata) {
+        if (!(flags & SD_VARLINK_METHOD_MORE))
+                return sd_varlink_error(link, "org.varlink.service.ExpectedMore", NULL);
+        return verify_user(link, parameters, true);
+}
+
 static int setup_varlink(sd_varlink_server *server, sd_event *event) {
         _cleanup_free_ char *address = NULL, *lock_path = NULL;
         const char *directory;
@@ -900,6 +994,10 @@ static int setup_varlink(sd_varlink_server *server, sd_event *event) {
                         server,
                         "io.platformd.Verify.VerifyUser",
                         vl_verify_user);
+        if (r < 0)
+                return r;
+        r = sd_varlink_server_bind_method(server, "io.platformd.Verify.VerifyUserWithMessages",
+                                          vl_verify_user_with_messages);
         if (r < 0)
                 return r;
         if ((r = sd_varlink_server_add_interface(server, &vl_interface_io_platformd_Verify)) < 0 ||
@@ -976,9 +1074,10 @@ int main(int argc, char *argv[]) {
 
         if (argc > 1 && streq(argv[1], "--pam-worker")) {
                 unsigned long uid;
+                long message_fd;
                 char *end;
 
-                if (argc != 5 || !argv[2][0] || !argv[3][0] ||
+                if (argc != 6 || !argv[2][0] || !argv[3][0] ||
                     !verify_text_valid(argv[4], VERIFY_REASON_MAX))
                         return WORKER_SETUP_FAILED;
                 errno = 0;
@@ -986,7 +1085,13 @@ int main(int argc, char *argv[]) {
                 if (errno != 0 || *end || uid >= (uid_t) -1 ||
                     (getuid() != 0 && uid != getuid()))
                         return WORKER_SETUP_FAILED;
-                return worker_run((uid_t) uid, argv[3], argv[4]);
+                errno = 0;
+                message_fd = strtol(argv[5], &end, 10);
+                if (errno != 0 || !argv[5][0] || *end || message_fd > INT_MAX ||
+                    (message_fd != -1 && message_fd < 3) ||
+                    (message_fd >= 0 && fcntl((int) message_fd, F_SETFD, FD_CLOEXEC) < 0))
+                        return WORKER_SETUP_FAILED;
+                return worker_run((uid_t) uid, argv[3], argv[4], (int) message_fd);
         }
 
         r = sd_event_default(&event);

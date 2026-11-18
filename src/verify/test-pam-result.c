@@ -115,10 +115,23 @@ int main(int argc, char **argv) {
                         assert(fprintf(f, "auth required %s %s\n", module, cases[i].fallback) > 0);
                 assert(fclose(f) == 0);
 
-                r = worker_run(getuid(), "test-user", "PAM result test");
+                r = worker_run(getuid(), "test-user", "PAM result test", -1);
                 fprintf(stderr, "%s, fallback=%s: %d (expected %d)\n",
                         cases[i].arguments, cases[i].fallback ?: "none", r, cases[i].expected);
                 assert(r == cases[i].expected);
+        }
+
+        {
+                int pair[2];
+                FILE *f = fopen(config, "we");
+
+                assert(f && fprintf(f, "auth required %s messages\n", module) > 0);
+                assert(fclose(f) == 0);
+                assert(worker_run(getuid(), "test-user", "legacy messages", -1) == EXIT_SUCCESS);
+                assert(socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pair) == 0);
+                assert(worker_run(getuid(), "test-user", "stream overflow", pair[1]) == WORKER_MESSAGE_FAILED);
+                close(pair[0]);
+                close(pair[1]);
         }
 
         assert(kill(pid, SIGTERM) == 0);

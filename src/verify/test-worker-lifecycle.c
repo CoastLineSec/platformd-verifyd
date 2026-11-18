@@ -27,6 +27,7 @@ static volatile sig_atomic_t interrupted;
 static const char *current_case;
 static char *daemon_log;
 static pid_t daemon_pid;
+static bool streaming;
 
 static uint64_t now_monotonic(void) {
         struct timespec ts;
@@ -101,10 +102,17 @@ static int on_reply(
         sd_json_variant *verified;
 
         check(!reply->done);
+        if (flags & SD_VARLINK_REPLY_CONTINUES) {
+                check(streaming && !error_id);
+                check(sd_json_variant_is_object(sd_json_variant_by_key(parameters, "message")));
+                return 0;
+        }
         reply->done = true;
         if (error_id)
                 check(snprintf(reply->error, sizeof reply->error, "%s", error_id) > 0);
         else {
+                if (streaming)
+                        parameters = sd_json_variant_by_key(parameters, "result");
                 verified = sd_json_variant_by_key(parameters, "verified");
                 check(verified && sd_json_variant_is_boolean(verified));
                 reply->verified = sd_json_variant_boolean(verified);
@@ -114,16 +122,18 @@ static int on_reply(
 
 static sd_varlink *start_request(const char *socket_path, Reply *reply) {
         sd_varlink *link = NULL;
+        sd_json_variant *parameters = NULL;
 
         check(sd_varlink_connect_address(&link, socket_path) >= 0);
         check(sd_varlink_set_relative_timeout(link, 5U * 1000000U) >= 0);
         sd_varlink_set_userdata(link, reply);
         check(sd_varlink_bind_reply(link, on_reply) >= 0);
-        check(sd_varlink_invokebo(
-                        link,
-                        "io.platformd.Verify.VerifyUser",
+        check(sd_json_buildo(&parameters,
                         SD_JSON_BUILD_PAIR_STRING("sessionId", "test-session"),
                         SD_JSON_BUILD_PAIR_STRING("reason", "worker lifecycle test")) >= 0);
+        check((streaming ? sd_varlink_observe(link, "io.platformd.Verify.VerifyUserWithMessages", parameters) :
+                           sd_varlink_invoke(link, "io.platformd.Verify.VerifyUser", parameters)) >= 0);
+        sd_json_variant_unref(parameters);
         check(sd_varlink_flush(link) >= 0);
         return link;
 }
@@ -316,6 +326,11 @@ int main(int argc, char **argv) {
         check(signal(SIGTERM, on_signal) != SIG_ERR);
         check(signal(SIGINT, on_signal) != SIG_ERR);
 
+        run_case(daemon, module, "success");
+        run_case(daemon, module, "timeout");
+        run_case(daemon, module, "disconnect");
+        run_case(daemon, module, "sigterm");
+        streaming = true;
         run_case(daemon, module, "success");
         run_case(daemon, module, "timeout");
         run_case(daemon, module, "disconnect");

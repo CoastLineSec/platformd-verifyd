@@ -14,12 +14,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static int close_inherited_fds(void) {
+static int close_inherited_fds(int preserve_fd) {
         struct dirent *entry;
         DIR *directory;
         int r = 0;
 
-        if (close_range(3, UINT_MAX, 0) >= 0)
+        if ((preserve_fd < 3 || preserve_fd == 3 || close_range(3, (unsigned) preserve_fd - 1, 0) >= 0) &&
+            close_range(preserve_fd < 3 ? 3 : (unsigned) preserve_fd + 1, UINT_MAX, 0) >= 0)
                 return 0;
 
         directory = opendir("/proc/self/fd");
@@ -36,7 +37,8 @@ static int close_inherited_fds(void) {
                         break;
                 }
                 fd = strtol(entry->d_name, &end, 10);
-                if (end == entry->d_name || *end || fd < 3 || fd > INT_MAX || fd == dirfd(directory))
+                if (end == entry->d_name || *end || fd < 3 || fd > INT_MAX ||
+                    fd == preserve_fd || fd == dirfd(directory))
                         continue;
                 if (close((int) fd) < 0 && errno != EBADF && errno != EINTR) {
                         r = -errno;
@@ -67,7 +69,7 @@ static int kill_children(FILE *children) {
         return r == EOF ? result : -EBADMSG;
 }
 
-pid_t verify_worker_fork(void) {
+pid_t verify_worker_fork(int preserve_fd) {
         pid_t parent = getpid(), pid;
         struct sigaction action = { .sa_handler = SIG_DFL };
         sigset_t signals;
@@ -91,7 +93,7 @@ pid_t verify_worker_fork(void) {
             prctl(PR_SET_CHILD_SUBREAPER, 1) < 0 ||
             prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 ||
             getppid() != parent ||
-            close_inherited_fds() < 0)
+            close_inherited_fds(preserve_fd) < 0)
                 _exit(EXIT_FAILURE);
 
         children = fopen("/proc/thread-self/children", "re");
@@ -112,6 +114,8 @@ pid_t verify_worker_fork(void) {
                         _exit(EXIT_FAILURE);
                 return 0;
         }
+        if (preserve_fd >= 3)
+                (void) close(preserve_fd);
 
         for (;;) {
                 pid_t reaped;

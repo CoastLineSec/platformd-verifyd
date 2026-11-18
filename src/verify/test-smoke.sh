@@ -61,6 +61,11 @@ if command -v varlinkctl >/dev/null 2>&1; then
         published=$(varlinkctl introspect "$SOCK" io.platformd.Verify | normalize_idl)
         expected=$(normalize_idl < "$(dirname "$0")/io.platformd.Verify.varlink")
         [ "$published" = "$expected" ] || fail 'published interface does not match its definition'
+        if R=$(varlinkctl call "$SOCK" io.platformd.Verify.VerifyUserWithMessages \
+                '{"sessionId":"","reason":"non-streaming"}' 2>&1); then
+                fail 'streaming method accepted a non-streaming call'
+        fi
+        echo "$R" | grep -q 'more' || fail "unexpected non-streaming error: $R"
         inode=$(stat -c %i "$SOCK")
         if "$VERIFYD" >/dev/null 2>&1; then
                 fail 'duplicate daemon accepted'

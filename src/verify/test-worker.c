@@ -1,8 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#undef NDEBUG
+
 #include "verify-worker.h"
 
 #include <errno.h>
+#include <assert.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -193,7 +196,7 @@ static void run_daemon(int control, int messages, int guard, int status, TestMod
         if (sigaction(SIGCHLD, &action, NULL) < 0)
                 child_fail();
 
-        pid = verify_worker_fork();
+        pid = verify_worker_fork(-1);
         if (pid < 0)
                 child_fail();
         if (pid == 0)
@@ -417,7 +420,29 @@ int main(void) {
                 return EXIT_FAILURE;
 
         for (unsigned fallback = 0; fallback < 2; fallback++) {
+                int preserve[2], guard, status;
+                pid_t worker;
+                char c;
+
                 force_close_range_fallback = fallback;
+                assert(pipe2(preserve, O_CLOEXEC) == 0);
+                guard = fcntl(preserve[1], F_DUPFD_CLOEXEC, 64);
+                assert(guard >= 64);
+                worker = verify_worker_fork(preserve[1]);
+                assert(worker >= 0);
+                if (worker == 0) {
+                        assert(fcntl(guard, F_GETFD) < 0 && errno == EBADF);
+                        assert(fcntl(preserve[0], F_GETFD) < 0 && errno == EBADF);
+                        assert(write(preserve[1], "x", 1) == 1);
+                        _exit(EXIT_SUCCESS);
+                }
+                close(preserve[1]);
+                close(guard);
+                assert(read(preserve[0], &c, 1) == 1 && c == 'x');
+                assert(read(preserve[0], &c, 1) == 0);
+                close(preserve[0]);
+                assert(waitpid(worker, &status, 0) == worker);
+                assert(WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS);
                 for (unsigned i = 0; i < 10; i++)
                         for (TestMode mode = TEST_SUCCESS; mode <= TEST_SIGCHLD_NOREAP; mode++)
                                 if (test_worker(mode) < 0)

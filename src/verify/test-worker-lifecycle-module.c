@@ -36,12 +36,20 @@ static void linger(const char *directory, const char *name) {
 }
 
 int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
+        const struct pam_conv *conversation;
+        const struct pam_message message = { PAM_TEXT_INFO, "lifecycle message" };
+        const struct pam_message *messages[] = { &message };
+        struct pam_response *response = NULL;
         char *release;
         pid_t pid;
         int status;
 
         if (argc != 1 || argv[0][0] != '/' || record_pid(argv[0], "worker") < 0)
                 return PAM_SERVICE_ERR;
+        if (pam_get_item(pamh, PAM_CONV, (const void **) &conversation) != PAM_SUCCESS ||
+            conversation->conv(1, messages, &response, conversation->appdata_ptr) != PAM_SUCCESS)
+                return PAM_CONV_ERR;
+        free(response);
 
         pid = fork();
         if (pid < 0)

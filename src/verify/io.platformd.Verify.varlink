@@ -27,6 +27,21 @@ method VerifyUser(
         realtimeUSec: int
 )
 
+type MessageStyle (info, error)
+type VerificationMessage (style: MessageStyle, text: string)
+type VerificationResult (verified: bool, method: string, realtimeUSec: int)
+
+# VerifyUser with PAM_TEXT_INFO/PAM_ERROR_MSG delivery. Requires more=true.
+# Intermediate replies contain only message; the terminal reply contains only
+# result, or an error. At most 32 messages of 1024 bytes each are delivered.
+# Invalid messages, overflow, or failed delivery cancel the request. No input
+# prompts or authentication responses are sent, and no message response is
+# accepted. Messages are PAM module text, not a trusted application identity.
+method VerifyUserWithMessages(sessionId: string, reason: string) -> (
+        message: ?VerificationMessage,
+        result: ?VerificationResult
+)
+
 error PermissionDenied()
 error VerificationUnsupported()
 error VerificationTimedOut()

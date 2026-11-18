@@ -46,6 +46,21 @@ int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **ar
                 return PAM_SUCCESS;
         if (argc == 1 && strcmp(argv[0], "deny") == 0)
                 return PAM_AUTH_ERR;
+        if (argc == 1 && strcmp(argv[0], "messages") == 0) {
+                const struct pam_conv *conversation;
+                const struct pam_message message = { PAM_TEXT_INFO, "message limit test" };
+                const struct pam_message *messages[] = { &message };
+
+                if (pam_get_item(pamh, PAM_CONV, (const void **) &conversation) != PAM_SUCCESS)
+                        return PAM_SERVICE_ERR;
+                for (unsigned i = 0; i < 33; i++) {
+                        struct pam_response *response = NULL;
+
+                        (void) conversation->conv(1, messages, &response, conversation->appdata_ptr);
+                        free(response);
+                }
+                return PAM_SUCCESS;
+        }
         if (argc != 2)
                 return PAM_SERVICE_ERR;
 

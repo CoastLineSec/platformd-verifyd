@@ -3,11 +3,13 @@
 #include "verify-util.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -101,6 +103,9 @@ int main(void) {
         };
         char *dir;
         pid_t pid;
+        int pair[2];
+        VerifyMessageState delivery = {};
+        VerifyMessage message;
 
         assert(verify_text_valid("", VERIFY_REASON_MAX));
         assert(verify_text_valid("valid reason", VERIFY_REASON_MAX));
@@ -131,13 +136,22 @@ int main(void) {
                 usleep(10000);
         assert(access(socket, F_OK) == 0);
 
+        assert(socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pair) == 0);
+        delivery.fd = pair[1];
+        context.messages = &delivery;
         assert(verify_pam_conversation(3, messages, &responses, &context) == PAM_SUCCESS);
+        assert(verify_message_receive(pair[0], &message) == 1);
+        assert(message.style == PAM_TEXT_INFO && strcmp(message.text, m1.msg) == 0);
+        assert(verify_message_receive(pair[0], &message) == -EAGAIN);
         assert(responses);
         assert(responses[0].resp && strcmp(responses[0].resp, "test-password") == 0);
         assert(!responses[1].resp);
         assert(responses[2].resp && strcmp(responses[2].resp, "test-password") == 0);
         verify_pam_responses_erase(responses, 3);
         responses = NULL;
+        close(pair[0]);
+        close(pair[1]);
+        context.messages = NULL;
 
         {
                 const struct pam_message timeout_message = {
