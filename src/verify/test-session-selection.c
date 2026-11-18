@@ -6,6 +6,7 @@
 #define sd_session_get_uid test_session_get_uid
 #define sd_session_get_username test_session_get_username
 #define sd_session_get_class test_session_get_class
+#define sd_session_get_state test_session_get_state
 #define sd_session_is_active test_session_is_active
 #define sd_session_is_remote test_session_is_remote
 #define sd_uid_get_sessions test_uid_get_sessions
@@ -21,6 +22,7 @@
 static bool first_locked, second_locked, malformed, unavailable, delayed, relock, accepted;
 static unsigned first_queries, second_queries, n_sessions = 2;
 static const char *peer_session, *result_error;
+static const char *first_state = "active", *second_state = "active", *session_class = "user";
 static char completed_session[32];
 static sd_bus_message *pending;
 
@@ -37,8 +39,17 @@ int test_session_get_username(const char *session, char **user) {
 }
 
 int test_session_get_class(const char *session, char **class) {
-        *class = strdup("user");
+        *class = strdup(session_class);
         return *class ? 0 : -ENOMEM;
+}
+
+int test_session_get_state(const char *session, char **state) {
+        const char *value = streq(session, "first") ? first_state : second_state;
+
+        if (!value)
+                return -ENODATA;
+        *state = strdup(value);
+        return *state ? 0 : -ENOMEM;
 }
 
 int test_session_is_active(const char *session) { return 1; }
@@ -147,6 +158,22 @@ static void await_request(void) {
 int main(void) {
         sd_bus *sender = NULL;
 
+        assert(session_eligible("first", getuid(), NULL) == 1);
+        session_class = "user-light";
+        assert(session_eligible("first", getuid(), NULL) == 1);
+        session_class = "user";
+        first_state = "closing";
+        assert(session_eligible("first", getuid(), NULL) == 0);
+        first_state = "opening";
+        assert(session_eligible("first", getuid(), NULL) == 0);
+        first_state = "online";
+        assert(session_eligible("first", getuid(), NULL) == 0);
+        first_state = "";
+        assert(session_eligible("first", getuid(), NULL) == 0);
+        first_state = NULL;
+        assert(session_eligible("first", getuid(), NULL) == -EIO);
+        first_state = "active";
+
         assert(sd_event_new(&g_event) >= 0);
         assert(sd_bus_open_user(&sender) >= 0);
         assert(sd_bus_attach_event(sender, g_event, 0) >= 0);
@@ -157,6 +184,21 @@ int main(void) {
         assert(sd_bus_attach_event(g_bus, g_event, 0) >= 0);
         assert(sd_bus_match_signal(g_bus, NULL, "org.freedesktop.DBus", "/org/freedesktop/DBus",
                                    "org.freedesktop.DBus", "NameOwnerChanged", on_logind_owner_changed, NULL) >= 0);
+
+        first_state = "closing";
+        start_request("first", 5000000);
+        assert(!g_verifications && !accepted && streq(result_error, "io.platformd.Verify.SessionNotEligible"));
+        assert(first_queries == 0 && second_queries == 0);
+        start_request("", 5000000);
+        await_completion();
+        assert(accepted && !result_error && streq(completed_session, "second"));
+        assert(first_queries == 0 && second_queries == 2);
+        second_state = "closing";
+        start_request("", 5000000);
+        await_completion();
+        assert(!accepted && streq(result_error, "io.platformd.Verify.NoSession"));
+        assert(first_queries == 0 && second_queries == 0);
+        first_state = second_state = "active";
 
         first_locked = true;
         start_request("", 5000000);

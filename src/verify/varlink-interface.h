@@ -31,6 +31,18 @@ static SD_VARLINK_DEFINE_METHOD_FULL(VerifyUserWithMessages, SD_VARLINK_REQUIRES
         SD_VARLINK_DEFINE_OUTPUT_BY_TYPE(message, VerificationMessage, SD_VARLINK_NULLABLE),
         SD_VARLINK_DEFINE_OUTPUT_BY_TYPE(result, VerificationResult, SD_VARLINK_NULLABLE));
 
+static SD_VARLINK_DEFINE_STRUCT_TYPE(VerificationContext,
+        SD_VARLINK_DEFINE_FIELD(challengeHex, SD_VARLINK_STRING, 0),
+        SD_VARLINK_DEFINE_FIELD(audience, SD_VARLINK_STRING, 0),
+        SD_VARLINK_DEFINE_FIELD(operationDigestHex, SD_VARLINK_STRING, 0));
+
+static SD_VARLINK_DEFINE_METHOD_FULL(VerifyUserWithContext, SD_VARLINK_REQUIRES_MORE,
+        SD_VARLINK_DEFINE_INPUT(sessionId, SD_VARLINK_STRING, 0),
+        SD_VARLINK_DEFINE_INPUT(reason, SD_VARLINK_STRING, 0),
+        SD_VARLINK_DEFINE_INPUT_BY_TYPE(context, VerificationContext, 0),
+        SD_VARLINK_DEFINE_OUTPUT_BY_TYPE(message, VerificationMessage, SD_VARLINK_NULLABLE),
+        SD_VARLINK_DEFINE_OUTPUT_BY_TYPE(result, VerificationResult, SD_VARLINK_NULLABLE));
+
 static SD_VARLINK_DEFINE_ERROR(VerificationUnsupported);
 
 static SD_VARLINK_DEFINE_ERROR(VerificationTimedOut);
@@ -53,6 +65,8 @@ static SD_VARLINK_DEFINE_INTERFACE(io_platformd_Verify, "io.platformd.Verify",
         &vl_type_VerificationMessage,
         &vl_type_VerificationResult,
         &vl_method_VerifyUserWithMessages,
+        &vl_type_VerificationContext,
+        &vl_method_VerifyUserWithContext,
         &vl_error_PermissionDenied,
         &vl_error_VerificationUnsupported,
         &vl_error_VerificationTimedOut,

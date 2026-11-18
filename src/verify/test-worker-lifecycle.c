@@ -28,6 +28,7 @@ static const char *current_case;
 static char *daemon_log;
 static pid_t daemon_pid;
 static bool streaming;
+static bool contextual;
 
 static uint64_t now_monotonic(void) {
         struct timespec ts;
@@ -131,7 +132,20 @@ static sd_varlink *start_request(const char *socket_path, Reply *reply) {
         check(sd_json_buildo(&parameters,
                         SD_JSON_BUILD_PAIR_STRING("sessionId", "test-session"),
                         SD_JSON_BUILD_PAIR_STRING("reason", "worker lifecycle test")) >= 0);
-        check((streaming ? sd_varlink_observe(link, "io.platformd.Verify.VerifyUserWithMessages", parameters) :
+        if (contextual) {
+                sd_json_variant *context = NULL;
+
+                check(sd_json_buildo(&context,
+                                SD_JSON_BUILD_PAIR_STRING("challengeHex",
+                                        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                                SD_JSON_BUILD_PAIR_STRING("audience", "service.example"),
+                                SD_JSON_BUILD_PAIR_STRING("operationDigestHex",
+                                        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")) >= 0);
+                check(sd_json_variant_set_field(&parameters, "context", context) >= 0);
+                sd_json_variant_unref(context);
+        }
+        check((streaming ? sd_varlink_observe(link, contextual ? "io.platformd.Verify.VerifyUserWithContext" :
+                                                               "io.platformd.Verify.VerifyUserWithMessages", parameters) :
                            sd_varlink_invoke(link, "io.platformd.Verify.VerifyUser", parameters)) >= 0);
         sd_json_variant_unref(parameters);
         check(sd_varlink_flush(link) >= 0);
@@ -330,7 +344,13 @@ int main(int argc, char **argv) {
         run_case(daemon, module, "timeout");
         run_case(daemon, module, "disconnect");
         run_case(daemon, module, "sigterm");
+
         streaming = true;
+        run_case(daemon, module, "success");
+        run_case(daemon, module, "timeout");
+        run_case(daemon, module, "disconnect");
+        run_case(daemon, module, "sigterm");
+        contextual = true;
         run_case(daemon, module, "success");
         run_case(daemon, module, "timeout");
         run_case(daemon, module, "disconnect");

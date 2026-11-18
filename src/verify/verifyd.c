@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "verify-util.h"
+#include "verify-context.h"
 #include "verify-worker.h"
 #include "varlink-interface.h"
 
@@ -37,6 +38,7 @@ static inline void freep(void *p) { free(*(void **) p); }
 
 #define VERIFY_MAX_INFLIGHT 8
 #define TRUST_SUBMIT_TIMEOUT_USEC (2U * 1000000U)
+#define TRUST_SUBMIT_MAX 64
 
 enum {
         WORKER_AUTH_FAILED = 1,
@@ -53,6 +55,7 @@ typedef struct TrustSubmission TrustSubmission;
 struct Verification {
         Verification *next;
         sd_varlink *link;
+        sd_json_variant *context;
         sd_event_source *worker;
         sd_event_source *timeout;
         sd_event_source *message_source;
@@ -132,7 +135,7 @@ static void strv_free(char **l) {
 
 
 static int session_eligible(const char *session, uid_t uid, char **ret_path) {
-        _cleanup_free_ char *class = NULL, *path = NULL;
+        _cleanup_free_ char *class = NULL, *path = NULL, *state = NULL;
         uid_t owner;
         int active, remote, r;
 
@@ -161,6 +164,10 @@ static int session_eligible(const char *session, uid_t uid, char **ret_path) {
         if (sd_session_get_class(session, &class) < 0)
                 return -EIO;
         if (!verify_session_class_allowed(class))
+                return 0;
+        if (sd_session_get_state(session, &state) < 0)
+                return -EIO;
+        if (!streq(state, "active"))
                 return 0;
         if (ret_path) {
                 r = sd_bus_path_encode("/org/freedesktop/login1/session", session, &path);
@@ -275,6 +282,7 @@ static void verification_free(Verification *v) {
         sd_bus_slot_unref(v->removed_slot);
         sd_bus_slot_unref(v->validation_slot);
         sd_varlink_unref(v->link);
+        sd_json_variant_unref(v->context);
         free(v->user);
         free(v->reason);
         free(v->session);
@@ -395,10 +403,18 @@ static int on_trust_timeout(sd_event_source *source, uint64_t usec, void *userda
         return 0;
 }
 
-static void submit_to_trustd(const char *user, uid_t uid, const char *session) {
+static void submit_to_trustd(Verification *v, uint64_t boottime_usec, uint64_t realtime_usec) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *parameters = NULL;
         TrustSubmission *submission;
         const char *address;
+        unsigned count = 0;
+        int r;
+
+        if (v->context && (!boottime_usec || !realtime_usec))
+                return;
+        for (submission = g_submissions; submission; submission = submission->next)
+                if (++count >= TRUST_SUBMIT_MAX)
+                        return;
 
         address = getenv("PLATFORMD_TRUST_SOCKET");
         if (!address || !*address)
@@ -407,16 +423,26 @@ static void submit_to_trustd(const char *user, uid_t uid, const char *session) {
         submission = calloc(1, sizeof *submission);
         if (!submission)
                 return;
-        if (sd_json_buildo(&parameters,
-                        SD_JSON_BUILD_PAIR("user", SD_JSON_BUILD_STRING(user)),
-                        SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(uid)),
+        if (v->context)
+                r = sd_json_buildo(&parameters,
+                        SD_JSON_BUILD_PAIR_STRING("user", v->user),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("uid", v->uid),
+                        SD_JSON_BUILD_PAIR_STRING("sessionId", v->session),
+                        SD_JSON_BUILD_PAIR_VARIANT("context", v->context),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("verificationBoottimeUSec", boottime_usec),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("verificationRealtimeUSec", realtime_usec));
+        else
+                r = sd_json_buildo(&parameters,
+                        SD_JSON_BUILD_PAIR("user", SD_JSON_BUILD_STRING(v->user)),
+                        SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(v->uid)),
                         SD_JSON_BUILD_PAIR("pamService", SD_JSON_BUILD_STRING("platformd-verify")),
                         SD_JSON_BUILD_PAIR("tty", SD_JSON_BUILD_STRING("")),
                         SD_JSON_BUILD_PAIR("remoteHost", SD_JSON_BUILD_STRING("")),
                         SD_JSON_BUILD_PAIR("phase", SD_JSON_BUILD_STRING("verify")),
                         SD_JSON_BUILD_PAIR("declaredMethod", SD_JSON_BUILD_STRING("platformd-verify")),
                         SD_JSON_BUILD_PAIR("result", SD_JSON_BUILD_STRING("success")),
-                        SD_JSON_BUILD_PAIR("sessionId", SD_JSON_BUILD_STRING(session))) < 0 ||
+                        SD_JSON_BUILD_PAIR("sessionId", SD_JSON_BUILD_STRING(v->session)));
+        if (r < 0 ||
             sd_varlink_connect_address(&submission->link, address) < 0) {
                 trust_submission_free(submission);
                 return;
@@ -435,7 +461,8 @@ static void submit_to_trustd(const char *user, uid_t uid, const char *session) {
                             submission) < 0 ||
             sd_varlink_invoke(
                             submission->link,
-                            "io.platformd.Trust.SubmitAuthEvent",
+                            v->context ? "io.platformd.Trust.SubmitVerificationEvent" :
+                                         "io.platformd.Trust.SubmitAuthEvent",
                             parameters) < 0) {
                 trust_submission_free(submission);
                 return;
@@ -448,9 +475,11 @@ static void submit_to_trustd(const char *user, uid_t uid, const char *session) {
 static void verification_complete(Verification *v) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *result = NULL;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
+        uint64_t verification_boottime = 0, verification_realtime = 0;
         bool verified;
         const char *outcome;
         int status = v->result_status;
+        int reply_status = -EIO;
 
         v->timed_out |= verification_expired(v);
         if (v->selecting) {
@@ -464,6 +493,18 @@ static void verification_complete(Verification *v) {
                 v->cancelled = true;
         v->timed_out |= verification_expired(v);
         verified = status == EXIT_SUCCESS && !v->timed_out && !v->cancelled;
+
+        if (verified && !v->client_gone && v->context) {
+                struct timespec boot, real;
+
+                if (clock_gettime(CLOCK_BOOTTIME, &boot) >= 0 &&
+                    clock_gettime(CLOCK_REALTIME, &real) >= 0 &&
+                    boot.tv_sec >= 0 && (uint64_t) boot.tv_sec < UINT64_MAX / 1000000U &&
+                    real.tv_sec >= 0 && (uint64_t) real.tv_sec < UINT64_MAX / 1000000U) {
+                        verification_boottime = (uint64_t) boot.tv_sec * 1000000U + boot.tv_nsec / 1000U;
+                        verification_realtime = (uint64_t) real.tv_sec * 1000000U + real.tv_nsec / 1000U;
+                }
+        }
 
         if (v->timed_out || status == WORKER_PROMPT_TIMED_OUT)
                 outcome = "timeout";
@@ -510,10 +551,10 @@ static void verification_complete(Verification *v) {
                                                         SD_JSON_BUILD_STRING("platformd-verify")),
                                         SD_JSON_BUILD_PAIR(
                                                         "realtimeUSec",
-                                                        SD_JSON_BUILD_UNSIGNED(now_real()))) >= 0 &&
+                                                        SD_JSON_BUILD_UNSIGNED(verification_realtime ?: now_real()))) >= 0 &&
                          (!v->messages || sd_json_buildo(&reply,
                                         SD_JSON_BUILD_PAIR("result", SD_JSON_BUILD_VARIANT(result))) >= 0))
-                        (void) sd_varlink_reply(v->link, v->messages ? reply : result);
+                        reply_status = sd_varlink_reply(v->link, v->messages ? reply : result);
                 else
                         (void) sd_varlink_error(
                                         v->link,
@@ -521,8 +562,8 @@ static void verification_complete(Verification *v) {
                                         NULL);
         }
 
-        if (verified && !v->client_gone)
-                submit_to_trustd(v->user, v->uid, v->session);
+        if (verified && !v->client_gone && (!v->context || reply_status >= 0))
+                submit_to_trustd(v, verification_boottime, verification_realtime);
         verification_free(v);
 }
 
@@ -889,9 +930,11 @@ static int verification_launch(Verification *v) {
 static int verify_user(
                 sd_varlink *link,
                 sd_json_variant *parameters,
-                bool messages) {
+                bool messages,
+                bool contextual) {
 
         _cleanup_free_ char *session = NULL, *session_object = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *context = NULL;
         char **candidates = NULL;
         const char *requested, *reason;
         Verification *v = NULL;
@@ -921,6 +964,12 @@ static int verify_user(
         if (!verify_text_valid(reason, VERIFY_REASON_MAX))
                 return sd_varlink_error_invalid_parameter_name(link, "reason");
 
+        if (contextual) {
+                r = verify_context_parse(sd_json_variant_by_key(parameters, "context"), &context);
+                if (r < 0)
+                        return r == -ENOMEM ? r : sd_varlink_error_invalid_parameter_name(link, "context");
+        }
+
         r = select_session(peer, peer_pid, requested, &session, &session_object, &candidates);
         if (r < 0)
                 return sd_varlink_error(link, session_error(r), NULL);
@@ -931,6 +980,8 @@ static int verify_user(
                 return -ENOMEM;
         }
         v->link = sd_varlink_ref(link);
+        v->context = context;
+        context = NULL;
         v->messages = messages;
         v->message_fd = -1;
         v->uid = peer;
@@ -961,14 +1012,21 @@ static int verify_user(
 
 static int vl_verify_user(sd_varlink *link, sd_json_variant *parameters,
                           sd_varlink_method_flags_t flags, void *userdata) {
-        return verify_user(link, parameters, false);
+        return verify_user(link, parameters, false, false);
 }
 
 static int vl_verify_user_with_messages(sd_varlink *link, sd_json_variant *parameters,
                                         sd_varlink_method_flags_t flags, void *userdata) {
         if (!(flags & SD_VARLINK_METHOD_MORE))
                 return sd_varlink_error(link, "org.varlink.service.ExpectedMore", NULL);
-        return verify_user(link, parameters, true);
+        return verify_user(link, parameters, true, false);
+}
+
+static int vl_verify_user_with_context(sd_varlink *link, sd_json_variant *parameters,
+                                      sd_varlink_method_flags_t flags, void *userdata) {
+        if (!(flags & SD_VARLINK_METHOD_MORE))
+                return sd_varlink_error(link, "org.varlink.service.ExpectedMore", NULL);
+        return verify_user(link, parameters, true, true);
 }
 
 static int setup_varlink(sd_varlink_server *server, sd_event *event) {
@@ -998,6 +1056,10 @@ static int setup_varlink(sd_varlink_server *server, sd_event *event) {
                 return r;
         r = sd_varlink_server_bind_method(server, "io.platformd.Verify.VerifyUserWithMessages",
                                           vl_verify_user_with_messages);
+        if (r < 0)
+                return r;
+        r = sd_varlink_server_bind_method(server, "io.platformd.Verify.VerifyUserWithContext",
+                                          vl_verify_user_with_context);
         if (r < 0)
                 return r;
         if ((r = sd_varlink_server_add_interface(server, &vl_interface_io_platformd_Verify)) < 0 ||

@@ -42,6 +42,27 @@ method VerifyUserWithMessages(sessionId: string, reason: string) -> (
         result: ?VerificationResult
 )
 
+type VerificationContext (
+        challengeHex: string,
+        audience: string,
+        operationDigestHex: string
+)
+
+# VerifyUserWithMessages with immutable application-supplied context. The
+# challenge and operation digest each contain exactly 32 bytes encoded as hex;
+# submitted hex is lowercase. audience contains 1 through 256 printable ASCII
+# bytes and is compared without normalization. Context is copied before PAM.
+# On success, SubmitVerificationEvent is attempted asynchronously with the
+# context and final verification completion timestamps, after worker cleanup
+# and session validation. These are not timestamps of the PAM module return.
+# The result reports PAM success, not
+# measurement, remote acceptance, application identity, or operation approval.
+# Context is not an authentication response and must not contain secrets.
+method VerifyUserWithContext(sessionId: string, reason: string, context: VerificationContext) -> (
+        message: ?VerificationMessage,
+        result: ?VerificationResult
+)
+
 error PermissionDenied()
 error VerificationUnsupported()
 error VerificationTimedOut()

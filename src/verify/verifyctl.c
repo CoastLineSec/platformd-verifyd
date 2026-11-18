@@ -1,11 +1,16 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 /* verifyctl requests presence verification from platformd-verifyd. */
 
+#include "verify-context.h"
+
 #include <stdbool.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <systemd/sd-json.h>
 #include <systemd/sd-login.h>
@@ -74,7 +79,7 @@ fail:
         return 0;
 }
 
-static int verify_with_messages(sd_varlink *link, sd_json_variant *params,
+static int verify_with_messages(sd_varlink *link, sd_json_variant *params, bool contextual,
                                 sd_json_variant **ret, char **ret_error) {
         VerificationReply reply = {};
         int r;
@@ -82,7 +87,8 @@ static int verify_with_messages(sd_varlink *link, sd_json_variant *params,
         sd_varlink_set_userdata(link, &reply);
         r = sd_varlink_bind_reply(link, on_reply);
         if (r >= 0)
-                r = sd_varlink_observe(link, "io.platformd.Verify.VerifyUserWithMessages", params);
+                r = sd_varlink_observe(link, contextual ? "io.platformd.Verify.VerifyUserWithContext" :
+                                                          "io.platformd.Verify.VerifyUserWithMessages", params);
         while (r >= 0 && !reply.done) {
                 r = sd_varlink_process(link);
                 if (r == 0 && !reply.done)
@@ -92,7 +98,7 @@ static int verify_with_messages(sd_varlink *link, sd_json_variant *params,
                 r = reply.status;
         sd_varlink_set_userdata(link, NULL);
         (void) sd_varlink_bind_reply(link, NULL);
-        if (r >= 0 && reply.error && reply.messages == 0 &&
+        if (!contextual && r >= 0 && reply.error && reply.messages == 0 &&
             streq(reply.error, "org.varlink.service.MethodNotFound")) {
                 const char *error = NULL;
                 sd_json_variant *result = NULL;
@@ -111,10 +117,59 @@ static int verify_with_messages(sd_varlink *link, sd_json_variant *params,
         return r;
 }
 
-static int cmd_verify(const char *reason) {
+static int context_load(const char *path, sd_json_variant **ret) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *value = NULL;
+        char buffer[VERIFY_CONTEXT_FILE_MAX + 1];
+        struct stat st;
+        size_t size = 0;
+        int fd, r;
+
+        fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        if (fd < 0)
+                return -errno;
+        if (fstat(fd, &st) < 0) {
+                r = -errno;
+                goto finish;
+        }
+        if (!S_ISREG(st.st_mode)) {
+                r = -EINVAL;
+                goto finish;
+        }
+        while (size < sizeof buffer) {
+                ssize_t n = read(fd, buffer + size, sizeof buffer - size);
+
+                if (n < 0) {
+                        if (errno == EINTR)
+                                continue;
+                        r = -errno;
+                        goto finish;
+                }
+                if (n == 0)
+                        break;
+                size += n;
+        }
+        if (size > VERIFY_CONTEXT_FILE_MAX) {
+                r = -E2BIG;
+                goto finish;
+        }
+        if (memchr(buffer, 0, size)) {
+                r = -EINVAL;
+                goto finish;
+        }
+        buffer[size] = 0;
+        r = sd_json_parse(buffer, 0, &value, NULL, NULL);
+        if (r >= 0)
+                r = verify_context_parse(value, ret);
+finish:
+        close(fd);
+        return r;
+}
+
+static int cmd_verify(const char *reason, const char *context_path) {
         _cleanup_(sd_varlink_unrefp) sd_varlink *link = NULL;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *params = NULL;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *context = NULL;
         _cleanup_free_ char *addr = NULL, *session = NULL;
         _cleanup_free_ char *err = NULL;
         const char *sock = getenv("PLATFORMD_VERIFY_SOCKET");
@@ -122,6 +177,14 @@ static int cmd_verify(const char *reason) {
         sd_json_variant *v;
         bool verified;
         int r;
+
+        if (context_path) {
+                r = context_load(context_path, &context);
+                if (r < 0) {
+                        fprintf(stderr, "verifyctl: invalid verification context: %s\n", strerror(-r));
+                        return EXIT_FAILURE;
+                }
+        }
 
         /* Accept either an explicit socket path or a runtime directory. */
         if (sock && *sock) {
@@ -142,10 +205,12 @@ static int cmd_verify(const char *reason) {
                         SD_JSON_BUILD_PAIR("sessionId", SD_JSON_BUILD_STRING(session ?: "")),
                         SD_JSON_BUILD_PAIR("reason", SD_JSON_BUILD_STRING(reason ?: "verification requested"))) < 0)
                 return EXIT_FAILURE;
+        if (context && sd_json_variant_set_field(&params, "context", context) < 0)
+                return EXIT_FAILURE;
 
         printf("Verify user presence with the configured factor.\n");
         fflush(stdout);
-        r = verify_with_messages(link, params, &reply, &err);
+        r = verify_with_messages(link, params, context != NULL, &reply, &err);
         if (r < 0) {
                 fprintf(stderr, "verifyctl: call failed: %s\n", strerror(-r));
                 return EXIT_FAILURE;
@@ -171,10 +236,18 @@ int main(int argc, char *argv[]) {
         const char *cmd = argc > 1 ? argv[1] : "verify";
 
         if (streq(cmd, "verify"))
-                return cmd_verify(argc > 2 ? argv[2] : NULL);
+                return cmd_verify(argc > 2 ? argv[2] : NULL, NULL);
+        if (streq(cmd, "verify-context")) {
+                if (argc < 3 || argc > 4) {
+                        fputs("verifyctl: expected verify-context FILE [REASON]\n", stderr);
+                        return EXIT_FAILURE;
+                }
+                return cmd_verify(argc > 3 ? argv[3] : NULL, argv[2]);
+        }
         if (streq(cmd, "-h") || streq(cmd, "--help") || streq(cmd, "help")) {
                 printf("verifyctl: request a presence verification\n\n"
-                       "  verifyctl verify [REASON]   Prove the current user is present\n");
+                       "  verifyctl verify [REASON]                Prove the current user is present\n"
+                       "  verifyctl verify-context FILE [REASON]   Bind application context to verification\n");
                 return EXIT_SUCCESS;
         }
         fprintf(stderr, "verifyctl: unknown command '%s'\n", cmd);

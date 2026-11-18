@@ -5,6 +5,7 @@
 
 #define sd_session_get_uid test_session_get_uid
 #define sd_session_get_class test_session_get_class
+#define sd_session_get_state test_session_get_state
 #define sd_session_is_active test_session_is_active
 #define sd_session_is_remote test_session_is_remote
 #define main verifyd_main
@@ -15,6 +16,7 @@
 
 static bool locked, delayed, accepted;
 static const char *result_error;
+static const char *session_state = "active";
 static sd_bus_message *pending;
 
 int test_session_get_uid(const char *session, uid_t *uid) {
@@ -25,6 +27,13 @@ int test_session_get_uid(const char *session, uid_t *uid) {
 int test_session_get_class(const char *session, char **class) {
         *class = strdup("user");
         return *class ? 0 : -ENOMEM;
+}
+
+int test_session_get_state(const char *session, char **state) {
+        if (!session_state)
+                return -ENODATA;
+        *state = strdup(session_state);
+        return *state ? 0 : -ENOMEM;
 }
 
 int test_session_is_active(const char *session) {
@@ -111,6 +120,26 @@ int main(void) {
         start_validation(2000000);
         await_completion();
         assert(accepted && !result_error);
+
+        delayed = true;
+        start_validation(2000000);
+        await_request();
+        session_state = "closing";
+        assert(sd_bus_reply_method_return(pending, "v", "b", false) >= 0);
+        pending = sd_bus_message_unref(pending);
+        await_completion();
+        assert(!accepted && streq(result_error, "io.platformd.Verify.VerificationCancelled"));
+        session_state = "active";
+
+        start_validation(2000000);
+        await_request();
+        session_state = NULL;
+        assert(sd_bus_reply_method_return(pending, "v", "b", false) >= 0);
+        pending = sd_bus_message_unref(pending);
+        await_completion();
+        assert(!accepted && streq(result_error, "io.platformd.Verify.VerificationCancelled"));
+        session_state = "active";
+        delayed = false;
 
         locked = true;
         start_validation(2000000);

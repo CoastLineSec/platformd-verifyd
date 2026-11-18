@@ -60,6 +60,26 @@
         Only <constant>MethodNotFound</constant> before any message permits this
         fallback; a started verification is never retried.</para></listitem>
       </varlistentry>
+      <varlistentry>
+        <term><command>verify-context</command> <replaceable>FILE</replaceable>
+        <optional><replaceable>REASON</replaceable></optional></term>
+        <listitem><para>Verify presence with application-supplied context read
+        from a regular JSON file of at most 4096 bytes. The object must contain
+        exactly <varname>challengeHex</varname>, <varname>audience</varname>, and
+        <varname>operationDigestHex</varname>. The challenge and operation digest
+        each encode 32 bytes in hexadecimal. The audience is a nonempty string
+        of at most 256 printable ASCII bytes. Hexadecimal values are converted
+        to lowercase; the audience is not normalized. Context must not contain
+        secrets.</para>
+        <para>The command uses <function>VerifyUserWithContext</function> and
+        never falls back to another method. Message delivery and the result
+        have the same meaning as for <command>verify</command>. A successful
+        result does not establish measurement or acceptance by a remote service.
+        The remote verifier must require the exact context in complete,
+        challenge-bound evidence and apply its own expiry and replay policy.
+        The application defines the request bytes covered by the operation
+        digest.</para></listitem>
+      </varlistentry>
     </variablelist>
   </refsect1>
 
@@ -77,7 +97,9 @@
 
   <refsect1>
     <title>Exit status</title>
-    <para>0 is returned if the user was verified, a non-zero code otherwise.</para>
+    <para>0 is returned if the user was verified, a non-zero code otherwise.
+    This status does not report whether an authentication event was recorded
+    or accepted by a remote verifier.</para>
   </refsect1>
 
   <refsect1>

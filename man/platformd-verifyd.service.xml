@@ -85,6 +85,38 @@
     opt-in for each client; it does not add presentation to existing callers
     or unrelated desktop agents.</para>
 
+    <para><function>VerifyUserWithContext</function> uses the same message and
+    result contract and accepts an additional <varname>context</varname> object.
+    Its <varname>challengeHex</varname> and <varname>operationDigestHex</varname>
+    fields each encode exactly 32 bytes in hexadecimal. Its
+    <varname>audience</varname> field contains 1 through 256 printable ASCII
+    bytes. The context is copied before authentication; hexadecimal values are
+    converted to lowercase. The audience is not normalized. The context is
+    application-supplied data, not a verified origin or an authentication
+    response. It must not contain secrets and is not passed to PAM.</para>
+
+    <para>After successful authentication and final session validation,
+    <function>SubmitVerificationEvent</function> is attempted on
+    <constant>io.platformd.Trust</constant> with the caller's user, UID, session,
+    immutable context, and <varname>verificationBoottimeUSec</varname> and
+    <varname>verificationRealtimeUSec</varname> sampled using
+    <constant>CLOCK_BOOTTIME</constant> and <constant>CLOCK_REALTIME</constant>.
+    These timestamps denote completion after worker cleanup and final session
+    validation, not the instant the PAM module returned.
+    Submission is asynchronous and bounded to two seconds. At most 64
+    authentication submissions may remain pending. Missing services, unsupported
+    methods, full queues, and recording failures do not change the completed
+    PAM result. A contextual request never submits an ordinary authentication
+    event as a fallback.</para>
+
+    <para>The result does not establish measurement, remote acceptance, approval
+    of the described operation, or success of a particular factor. No attestation
+    token is returned through this interface. A remote verifier must require
+    the exact context in complete, challenge-bound evidence, check its enrolled
+    key and policy, and enforce challenge expiry and single use using its own
+    clock. Device timestamps do not establish remote freshness. Ordinary
+    verification and previously recorded freshness do not satisfy that check.</para>
+
     <para>The PAM conversation runs in a supervised worker, so a factor that waits at
     the reader does not block the service. One verification runs for each user at
     a time, with a bounded number across the machine. A concurrent call for the

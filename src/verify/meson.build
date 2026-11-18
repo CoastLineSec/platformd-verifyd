@@ -8,6 +8,7 @@ verifyd = executable(
         'verifyd.c',
         'verify-util.c',
         'verify-worker.c',
+        'verify-context.c',
         dependencies : [libsystemd, libpam],
         install : true,
         install_dir : get_option('libexecdir'),
@@ -18,6 +19,7 @@ verifyd_test = executable(
         'verifyd.c',
         'verify-util.c',
         'verify-worker.c',
+        'verify-context.c',
         c_args : ['-DVERIFYD_TESTING'],
         dependencies : [libsystemd, libpam],
 )
@@ -25,18 +27,19 @@ verifyd_test = executable(
 verifyctl = executable(
         'verifyctl',
         'verifyctl.c',
+        'verify-context.c',
         dependencies : libsystemd,
         install : true,
 )
 
 # Tests.
-test_verifyctl = executable('test-verifyctl', 'test-verifyctl.c', dependencies : libsystemd)
+test_verifyctl = executable('test-verifyctl', 'test-verifyctl.c', 'verify-context.c', dependencies : libsystemd)
 test('verifyctl', find_program('sh'),
      args : [meson.current_source_dir() / 'test-env.sh', test_verifyctl])
 
 test_messages = executable(
         'test-messages',
-        'test-messages.c', 'verify-util.c', 'verify-worker.c',
+        'test-messages.c', 'verify-util.c', 'verify-worker.c', 'verify-context.c',
         dependencies : [libsystemd, libpam],
         link_args : ['-Wl,--wrap=sd_varlink_notifyb', '-Wl,--wrap=sd_varlink_reply',
                      '-Wl,--wrap=sd_varlink_error', '-Wl,--wrap=sd_journal_send'],
@@ -49,6 +52,7 @@ test_deadline = executable(
         'test-deadline.c',
         'verify-util.c',
         'verify-worker.c',
+        'verify-context.c',
         dependencies : [libsystemd, libpam],
         link_args : ['-Wl,--wrap=sd_varlink_reply', '-Wl,--wrap=sd_varlink_error', '-Wl,--wrap=sd_journal_send'],
 )
@@ -57,7 +61,7 @@ test('deadline', find_program('sh'),
 
 test_logind = executable(
         'test-logind',
-        'test-logind.c', 'verify-util.c', 'verify-worker.c',
+        'test-logind.c', 'verify-util.c', 'verify-worker.c', 'verify-context.c',
         dependencies : [libsystemd, libpam],
         link_args : ['-Wl,--wrap=sd_varlink_reply', '-Wl,--wrap=sd_varlink_error', '-Wl,--wrap=sd_journal_send'],
 )
@@ -66,7 +70,7 @@ test('logind', find_program('sh'),
 
 test_session_selection = executable(
         'test-session-selection',
-        'test-session-selection.c', 'verify-util.c', 'verify-worker.c',
+        'test-session-selection.c', 'verify-util.c', 'verify-worker.c', 'verify-context.c',
         dependencies : [libsystemd, libpam],
         link_args : ['-Wl,--wrap=sd_varlink_reply', '-Wl,--wrap=sd_varlink_error', '-Wl,--wrap=sd_journal_send'],
 )
@@ -96,6 +100,7 @@ test_pam_result = executable(
         'test-pam-result.c',
         'verify-util.c',
         'verify-worker.c',
+        'verify-context.c',
         dependencies : [libsystemd, libpam],
 )
 test('pam-result', find_program('sh'),
@@ -148,6 +153,7 @@ test_worker_exec = executable(
         'test-worker-exec.c',
         'verify-util.c',
         'verify-worker.c',
+        'verify-context.c',
         c_args : ['-DVERIFYD_TESTING'],
         dependencies : [libsystemd, libpam, cc.find_library('dl')],
 )
@@ -164,6 +170,17 @@ test('worker-exec', find_program('sh'),
              test_worker_exec_module,
              verifyctl,
      ],
+     timeout : 30)
+
+test_context = executable(
+        'test-context',
+        'test-context.c', 'verify-util.c', 'verify-worker.c', 'verify-context.c',
+        dependencies : [libsystemd, libpam],
+        link_args : ['-Wl,--wrap=sd_varlink_reply', '-Wl,--wrap=sd_varlink_error',
+                     '-Wl,--wrap=sd_journal_send'],
+)
+test('context', find_program('sh'),
+     args : [meson.current_source_dir() / 'test-env.sh', test_context],
      timeout : 30)
 
 test('environment', find_program('sh'),
