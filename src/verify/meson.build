@@ -50,6 +50,15 @@ test_logind = executable(
 test('logind', find_program('sh'),
      args : [meson.current_source_dir() / 'test-logind.sh', test_logind])
 
+test_session_selection = executable(
+        'test-session-selection',
+        'test-session-selection.c', 'verify-util.c', 'verify-worker.c',
+        dependencies : [libsystemd, libpam],
+        link_args : ['-Wl,--wrap=sd_varlink_reply', '-Wl,--wrap=sd_varlink_error', '-Wl,--wrap=sd_journal_send'],
+)
+test('session-selection', find_program('sh'),
+     args : [meson.current_source_dir() / 'test-logind.sh', test_session_selection])
+
 test_conversation = executable(
         'test-conversation',
         'test-conversation.c',

@@ -59,6 +59,9 @@ struct Verification {
         char *reason;
         char *session;
         char *session_path;
+        char **candidate_sessions;
+        char *candidate_path;
+        size_t candidate_index;
         uid_t uid;
         pid_t pid;
         uint64_t deadline_usec;
@@ -67,6 +70,7 @@ struct Verification {
         bool client_gone;
         bool timed_out;
         bool cancelled;
+        bool selecting;
 };
 
 struct TrustSubmission {
@@ -85,6 +89,7 @@ static uint64_t g_verify_timeout = 120U * 1000000U;
 static void verification_complete(Verification *verification);
 static int verification_launch(Verification *verification);
 static int verification_validate(Verification *verification);
+static int verification_select_next(Verification *verification);
 
 #ifdef VERIFYD_TESTING
 static const char *test_session_id(void) {
@@ -165,15 +170,16 @@ static int select_session(
                 pid_t peer_pid,
                 const char *requested,
                 char **ret_session,
-                char **ret_path) {
+                char **ret_path,
+                char ***ret_candidates) {
 
         _cleanup_free_ char *peer_session = NULL, *selected = NULL, *path = NULL;
         char **sessions = NULL;
-        unsigned eligible = 0;
         int n, r;
 
         *ret_session = NULL;
         *ret_path = NULL;
+        *ret_candidates = NULL;
 
 #ifdef VERIFYD_TESTING
         const char *test_session = test_session_id();
@@ -224,38 +230,11 @@ static int select_session(
         n = sd_uid_get_sessions(uid, false, &sessions);
         if (n < 0)
                 return n;
-        for (int i = 0; i < n; i++) {
-                _cleanup_free_ char *candidate_path = NULL;
-
-                r = session_eligible(sessions[i], uid, &candidate_path);
-                if (r < 0) {
-                        strv_free(sessions);
-                        return r;
-                }
-                if (r == 0)
-                        continue;
-                eligible++;
-                if (eligible == 1) {
-                        selected = strdup(sessions[i]);
-                        path = candidate_path;
-                        candidate_path = NULL;
-                        if (!selected) {
-                                strv_free(sessions);
-                                return -ENOMEM;
-                        }
-                }
-        }
-        strv_free(sessions);
-
-        if (eligible == 0)
+        if (n == 0) {
+                strv_free(sessions);
                 return -ENXIO;
-        if (eligible > 1)
-                return -ENOTUNIQ;
-
-        *ret_session = selected;
-        selected = NULL;
-        *ret_path = path;
-        path = NULL;
+        }
+        *ret_candidates = sessions;
         return 0;
 }
 
@@ -290,7 +269,23 @@ static void verification_free(Verification *v) {
         free(v->reason);
         free(v->session);
         free(v->session_path);
+        strv_free(v->candidate_sessions);
+        free(v->candidate_path);
         free(v);
+}
+
+static void verification_error(Verification *v, const char *error) {
+        if (!v->client_gone)
+                (void) sd_varlink_error(v->link, error, NULL);
+        verification_free(v);
+}
+
+static const char *session_error(int error) {
+        if (error == -ENOTUNIQ)
+                return "io.platformd.Verify.AmbiguousSession";
+        if (error == -EACCES || error == -EHOSTDOWN)
+                return "io.platformd.Verify.SessionNotEligible";
+        return "io.platformd.Verify.NoSession";
 }
 
 static void verification_cancel(Verification *v) {
@@ -447,6 +442,12 @@ static void verification_complete(Verification *v) {
         int status = v->result_status;
 
         v->timed_out |= verification_expired(v);
+        if (v->selecting) {
+                verification_error(v, v->timed_out ?
+                                "io.platformd.Verify.VerificationTimedOut" :
+                                "io.platformd.Verify.VerificationCancelled");
+                return;
+        }
         if (!v->timed_out && !v->cancelled &&
             session_eligible(v->session, v->uid, NULL) != 1)
                 v->cancelled = true;
@@ -675,6 +676,108 @@ static int verification_validate(Verification *v) {
         return sd_bus_call_async(g_bus, &v->validation_slot, message, on_session_validated, v, 2U * 1000000U);
 }
 
+static int verification_start(Verification *v) {
+        int r;
+
+#ifdef VERIFYD_TESTING
+        if (test_session_id())
+                v->user = strdup("test-user");
+        else
+#endif
+                (void) sd_session_get_username(v->session, &v->user);
+        if (!v->user)
+                return -ENXIO;
+        r = prepare_monitor(v);
+        if (r < 0)
+                return r;
+        v->selecting = false;
+
+        sd_journal_send(
+                        "MESSAGE=presence verification requested",
+                        "PLATFORMD_EVENT=verify-request",
+                        "PLATFORMD_VERIFY_USER=%s", v->user,
+                        "PLATFORMD_VERIFY_SESSION=%s", v->session,
+                        "PLATFORMD_VERIFY_REASON=%s", v->reason,
+                        NULL);
+        return verification_validate(v);
+}
+
+static int on_candidate_validated(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        Verification *v = userdata;
+        const char *candidate = v->candidate_sessions[v->candidate_index];
+        int locked, r;
+
+        v->validation_slot = sd_bus_slot_unref(v->validation_slot);
+        if (verification_expired(v)) {
+                verification_complete(v);
+                return 0;
+        }
+        if (sd_bus_message_is_method_error(message, NULL) ||
+            sd_bus_message_enter_container(message, 'v', "b") <= 0 ||
+            sd_bus_message_read(message, "b", &locked) <= 0 ||
+            sd_bus_message_exit_container(message) < 0 ||
+            sd_bus_message_at_end(message, true) <= 0) {
+                verification_error(v, "io.platformd.Verify.NoSession");
+                return 0;
+        }
+        r = session_eligible(candidate, v->uid, NULL);
+        if (r < 0) {
+                verification_error(v, session_error(r));
+                return 0;
+        }
+        if (r > 0 && !locked) {
+                if (v->session) {
+                        verification_error(v, "io.platformd.Verify.AmbiguousSession");
+                        return 0;
+                }
+                v->session = strdup(candidate);
+                if (!v->session) {
+                        verification_error(v, "io.platformd.Verify.VerificationUnsupported");
+                        return 0;
+                }
+                v->session_path = v->candidate_path;
+                v->candidate_path = NULL;
+        }
+        free(v->candidate_path);
+        v->candidate_path = NULL;
+        v->candidate_index++;
+        r = verification_select_next(v);
+        if (r < 0)
+                verification_error(v, session_error(r));
+        return 0;
+}
+
+static int verification_select_next(Verification *v) {
+        int r;
+
+        if (verification_expired(v)) {
+                verification_complete(v);
+                return 0;
+        }
+        for (; v->candidate_sessions[v->candidate_index]; v->candidate_index++) {
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *message = NULL;
+
+                r = session_eligible(v->candidate_sessions[v->candidate_index], v->uid, &v->candidate_path);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        continue;
+                if (!g_bus)
+                        return -ENOTCONN;
+                if ((r = sd_bus_message_new_method_call(g_bus, &message, "org.freedesktop.login1",
+                                                        v->candidate_path, "org.freedesktop.DBus.Properties", "Get")) < 0 ||
+                    (r = sd_bus_message_append(message, "ss", "org.freedesktop.login1.Session", "LockedHint")) < 0)
+                        return r;
+                return sd_bus_call_async(g_bus, &v->validation_slot, message, on_candidate_validated,
+                                         v, 2U * 1000000U);
+        }
+        strv_free(v->candidate_sessions);
+        v->candidate_sessions = NULL;
+        if (!v->session)
+                return -ENXIO;
+        return verification_start(v);
+}
+
 static int verification_launch(Verification *v) {
         pid_t pid;
         int r;
@@ -708,7 +811,8 @@ static int vl_verify_user(
                 sd_varlink_method_flags_t flags,
                 void *userdata) {
 
-        _cleanup_free_ char *session = NULL, *session_object = NULL, *user = NULL;
+        _cleanup_free_ char *session = NULL, *session_object = NULL;
+        char **candidates = NULL;
         const char *requested, *reason;
         Verification *v = NULL;
         sd_json_variant *p;
@@ -737,58 +841,39 @@ static int vl_verify_user(
         if (!verify_text_valid(reason, VERIFY_REASON_MAX))
                 return sd_varlink_error_invalid_parameter_name(link, "reason");
 
-        r = select_session(peer, peer_pid, requested, &session, &session_object);
-        if (r == -ENOTUNIQ)
-                return sd_varlink_error(link, "io.platformd.Verify.AmbiguousSession", NULL);
-        if (r == -EACCES)
-                return sd_varlink_error(link, "io.platformd.Verify.SessionNotEligible", NULL);
+        r = select_session(peer, peer_pid, requested, &session, &session_object, &candidates);
         if (r < 0)
-                return sd_varlink_error(link, "io.platformd.Verify.NoSession", NULL);
-
-#ifdef VERIFYD_TESTING
-        if (test_session_id())
-                user = strdup("test-user");
-        else
-#endif
-                (void) sd_session_get_username(session, &user);
-        if (!user)
-                return sd_varlink_error(link, "io.platformd.Verify.NoSession", NULL);
+                return sd_varlink_error(link, session_error(r), NULL);
 
         v = calloc(1, sizeof *v);
-        if (!v)
+        if (!v) {
+                strv_free(candidates);
                 return -ENOMEM;
+        }
         v->link = sd_varlink_ref(link);
         v->uid = peer;
-        v->user = user;
-        user = NULL;
         v->session = session;
         session = NULL;
         v->session_path = session_object;
         session_object = NULL;
+        v->candidate_sessions = candidates;
+        v->selecting = true;
         v->reason = strdup(reason);
         v->result_status = WORKER_SETUP_FAILED;
         if (!v->reason ||
             sd_event_add_time_relative(g_event, &v->timeout, CLOCK_BOOTTIME, g_verify_timeout, 0,
                                        on_verify_timeout, v) < 0 ||
-            sd_event_source_get_time(v->timeout, &v->deadline_usec) < 0 || prepare_monitor(v) < 0) {
+            sd_event_source_get_time(v->timeout, &v->deadline_usec) < 0) {
                 verification_free(v);
                 return sd_varlink_error(link, "io.platformd.Verify.SessionNotEligible", NULL);
         }
 
-        sd_journal_send(
-                        "MESSAGE=presence verification requested",
-                        "PLATFORMD_EVENT=verify-request",
-                        "PLATFORMD_VERIFY_USER=%s", v->user,
-                        "PLATFORMD_VERIFY_SESSION=%s", v->session,
-                        "PLATFORMD_VERIFY_REASON=%s", reason,
-                        NULL);
-
-
         v->next = g_verifications;
         g_verifications = v;
         g_n_verifications++;
-        if (verification_validate(v) < 0)
-                verification_cancel(v);
+        r = candidates ? verification_select_next(v) : verification_start(v);
+        if (r < 0)
+                verification_error(v, session_error(r));
         return 0;
 }
 
