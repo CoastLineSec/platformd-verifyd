@@ -1,6 +1,31 @@
 platformd-verifyd NEWS
 ======================
 
+CHANGES WITH 0.1.4:
+
+        * Added VerifyUserWithMessages(), which streams PAM informational and
+          error messages during verification. verifyctl displays them on
+          standard error. VerifyUser() continues to return only the outcome.
+          Authentication responses are not returned to callers.
+
+        * Added VerifyUserWithContext() and verifyctl verify-context. These
+          bind a verification to a challenge, audience, and operation
+          digest. On success, the service attempts to submit the matching
+          completion record to platformd-trustd. A successful reply reports
+          PAM success, not attestation or authorization.
+
+        * The service now checks logind session eligibility before and after
+          running PAM. Locked sessions are excluded from fallback selection,
+          and results received after the verification deadline are rejected.
+
+        * PAM workers now start with unrelated inherited file descriptors
+          closed. Remaining PAM descendants are terminated and reaped before
+          the verification slot is released. Response buffers owned by the
+          service are erased before release.
+
+        * A successful PAM stack result is no longer overridden by an
+          earlier password conversation failure.
+
 CHANGES WITH 0.1.3:
 
         * VerifyUser requests are now bound to an active, local, unlocked
