@@ -8,6 +8,19 @@ fail() {
     exit 1
 }
 
+process_is_live() {
+    if ! read -r process_stat 2>/dev/null <"/proc/$1/stat"; then
+        kill -0 "$1" 2>/dev/null
+        return
+    fi
+
+    # A terminated process may remain visible until its reaper collects it.
+    case "${process_stat##*) }" in
+        Z\ *|X\ *) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 if [ "${1-}" = --wait-for-signal ]; then
     sleep 60 &
     child_pid=$!
@@ -123,7 +136,7 @@ wait "$wrapper_pid" || status=$?
 wrapper_pid=
 [ "$status" -eq 143 ] || fail 'wrapper did not report termination'
 [ ! -e "$isolated_dir" ] || fail 'terminated wrapper retained its directory'
-if kill -0 "$probe_pid" 2>/dev/null || kill -0 "$child_pid" 2>/dev/null; then
-    fail 'terminated wrapper retained a child process'
+if process_is_live "$probe_pid" || process_is_live "$child_pid"; then
+    fail 'terminated wrapper retained a live child process'
 fi
 printf '%s\n' 'OK: tests discard inherited service configuration'
