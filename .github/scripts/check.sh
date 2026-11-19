@@ -21,7 +21,7 @@ run() {
 }
 
 cd -- "$source_dir"
-git diff --check
+git -c safe.directory="$source_dir" diff --check
 shellcheck .github/scripts/check.sh
 actionlint .github/workflows/ci.yml
 for file in man/*.xml; do
